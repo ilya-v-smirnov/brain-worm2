@@ -1,0 +1,6 @@
+{
+  "default_language": "EN",
+  "default_model": "gpt-4.1-mini",
+  "default_prompt_file": "prompt_summarize.json",
+  "openai_api_key": "API-KEY-HERE"
+}

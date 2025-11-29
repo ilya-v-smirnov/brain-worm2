@@ -1,0 +1,46 @@
+# Виртуальные окружения
+venv/
+
+# Кэш и байткод Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Логи
+*.log
+
+# Конфиги окружения / секреты
+*.env
+.env.*
+*.ini
+*.cfg
+
+# VS Code и другие IDE
+.vscode/
+.idea/
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Тестовые артефакты (результаты тестов, coverage и т.п.)
+.coverage
+htmlcov/
+.coverage.*
+.tox/
+.nox/
+pytest_cache/
+junit*.xml
+
+# Сгенерированные/временные файлы
+*.tmp
+*.swp
+*.swo
+
+# Игнорируемые папки
+
+example_pdfs/
+
+# Исключения
+config/settings.json 
+config/settings.json
