@@ -36,7 +36,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import warnings
+
+try:
+    # Глушим предупреждение BeautifulSoup про HTML-парсер на XML.
+    # В современных версиях bs4 класс лежит в bs4.builder.
+    try:
+        from bs4.builder import XMLParsedAsHTMLWarning  # основной путь
+    except Exception:
+        # Fallback для старых/нестандартных версий bs4
+        from bs4 import XMLParsedAsHTMLWarning  # type: ignore[assignment]
+
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+except Exception:
+    # Если bs4 нет или структура другая — просто не глушим, но не падаем
+    pass
+
+
 from scipdf import parse_pdf_to_dict
+
+try:
+    import pdfplumber  # type: ignore[import]
+except Exception:  # ModuleNotFoundError, ImportError, etc.
+    pdfplumber = None  # type: ignore[assignment]
 
 
 YEAR_MIN = 1980
@@ -197,95 +219,249 @@ def _collect_sections(article: Dict[str, Any]) -> List[SectionInfo]:
     return result
 
 
+def _is_trivial_figure_caption(caption: str, fig_no: int) -> bool:
+    """
+    Эвристика: считаем подпись "тривиальной", если она содержит только метку
+    вида "Figure N" / "Figure N." / "Figure N:" или "Fig. N" без описательного текста.
+    """
+    cap = caption.strip()
+    if not cap:
+        return True
+    # Явное совпадение с Figure <N> или Fig. <N> и, возможно, завершающей пунктуацией
+    pattern = rf"^(?:Figure|Fig\.)\s*{fig_no}\s*[:\.]?$"
+    if re.match(pattern, cap, flags=re.IGNORECASE):
+        return True
+    # Очень короткая подпись без описания
+    if len(cap) <= 12 and " " not in cap[cap.lower().find(str(fig_no)) + len(str(fig_no)) :]:
+        return True
+    return False
+
+
 def _extract_figures(article: Dict[str, Any]) -> List[Dict[str, Union[int, str]]]:
     """
-    Извлекает подписи к рисункам и номера фигур.
+    Извлекает подписи к рисункам и номера фигур ТОЛЬКО из основного текста статьи.
 
-    Стратегия (двухступенчатая):
+    Мы намеренно НЕ используем article["figures"] из scipdf, а ищем подписи как целые абзацы,
+    начинающиеся с одного из следующих паттернов (в начале строки / абзаца):
 
-    1) Сначала пытаемся найти подписи в тексте статьи по шаблонам:
-        - строки, содержащие "Figure N" или "Fig. N"
-        - номер берём из этой строки
-    2) Если ничего не нашли, fallback к article["figures"]:
-        - figure_number: порядковый номер (1, 2, 3, ...)
-        - caption:
-            * если scipdf дал осмысленный caption — используем его;
-            * если нет — используем просто "Figure <i>", чтобы не было пустых подписей.
+    Паттерн 1: "Figure N", "Figure N.", "Figure N:", "Figure N)" и т.п.
+        - регулярное выражение: ^(Figure|FIGURE)\s+([0-9]+)[\.:)]?\s*(.*)$
+
+    Паттерн 2: "Fig. N", "Fig. N.", "Fig. N:", "Fig. N)" и т.п.
+        - регулярное выражение: ^(Fig\.|FIG\.)\s+([0-9]+)[\.:)]?\s*(.*)$
+
+    Где:
+        - N — целое положительное число (номер рисунка);
+        - (.*) — оставшийся текст строки после префикса "Figure N" / "Fig. N" (может быть пустым).
+
+    Подписью считаем ВЕСЬ абзац целиком, а не только первую строку.
+    Абзацы выделяем по двум и более переводам строки (пустая строка разделяет абзацы).
     """
     figures: List[Dict[str, Union[int, str]]] = []
 
-    # ---------- 1. Попробуем вытащить подписи из текста ----------
     sections = article.get("sections") or []
-    caption_candidates: List[str] = []
-    seen_numbers: set[int] = set()
+    if not isinstance(sections, list):
+        return figures
 
+    # Собираем все тексты секций в один список абзацев
+    paragraphs: List[str] = []
     for sec in sections:
         if not isinstance(sec, dict):
             continue
         text = sec.get("text") or sec.get("paragraph") or ""
         if not isinstance(text, str):
             continue
+        # Делим на абзацы по 1+ пустым строкам
+        raw_paragraphs = re.split(r"\n\s*\n", text)
+        for para in raw_paragraphs:
+            para_norm = para.strip()
+            if para_norm:
+                paragraphs.append(para_norm)
 
-        for line in text.splitlines():
-            s = line.strip()
-            # Ищем "Figure 1", "Fig. 2", "Figure 3A" и т.п. где угодно в строке
-            m = re.search(r"(Figure|Fig\.)\s+(\d+)[A-Za-z]?", s)
-            if m:
-                num = int(m.group(2))
-                if num in seen_numbers:
-                    continue
-                seen_numbers.add(num)
-                caption_candidates.append(s)
+    # Паттерн 1: Figure N ...
+    pattern_figure = re.compile(r"^(Figure|FIGURE)\s+([0-9]+)[\.:)]?\s*(.*)$")
+    # Паттерн 2: Fig. N ...
+    pattern_fig = re.compile(r"^(Fig\.|FIG\.)\s+([0-9]+)[\.:)]?\s*(.*)$")
 
-    if caption_candidates:
-        for cap in caption_candidates:
-            m = re.search(r"(?:Figure|Fig\.)\s+(\d+)", cap)
-            if m:
-                fig_no: Union[int, str] = int(m.group(1))
-            else:
-                fig_no = len(figures) + 1
+    seen_numbers: set[int] = set()
 
-            figures.append(
-                {
-                    "figure_number": fig_no,
-                    "caption": cap,
-                }
-            )
-        return figures
+    for para in paragraphs:
+        # Пытаемся сопоставить с "Figure N ..."
+        m = pattern_figure.match(para)
+        if not m:
+            # Если не подошло, пробуем "Fig. N ..."
+            m = pattern_fig.match(para)
 
-    # ---------- 2. Fallback: используем article["figures"] ----------
-    figures_raw = article.get("figures") or []
-    for i, fig in enumerate(figures_raw, start=1):
-        if not isinstance(fig, dict):
+        if not m:
             continue
 
-        caption_raw = (
-            fig.get("caption")
-            or fig.get("fig_caption")
-            or fig.get("text")
-            or ""
-        )
-        if not isinstance(caption_raw, str):
-            caption_raw = ""
+        # Во всех паттернах вторая группа — номер N
+        num_str = m.group(2)
+        try:
+            num = int(num_str)
+        except ValueError:
+            continue
 
-        caption_raw = caption_raw.strip()
-
-        # Если у scipdf есть нормальный caption — используем его.
-        # Если нет — хотя бы ставим "Figure <i>", чтобы не было пустоты.
-        if caption_raw:
-            caption = caption_raw
-        else:
-            caption = f"Figure {i}"
-
-        fig_number: Union[int, str] = i
+        if num in seen_numbers:
+            # Не дублируем один и тот же номер
+            continue
+        seen_numbers.add(num)
 
         figures.append(
             {
-                "figure_number": fig_number,
-                "caption": caption,
+                "figure_number": num,
+                "caption": para.strip(),
             }
         )
 
+    # figures всегда остаётся списком (возможно, пустым), как требует спецификация
+    return figures
+
+
+def _extract_figures_from_pdf_text(pdf_path: Path) -> List[Dict[str, Union[int, str]]]:
+    """
+    Извлекает подписи к рисункам, читая текст PDF напрямую через pdfplumber.
+
+    Логика:
+
+    1) Читаем текст построчно со всех страниц.
+    2) Ищем строки, которые НАЧИНАЮТСЯ с одного из паттернов (без учёта регистра):
+
+       Паттерн 1 (Figure):
+           ^\\s*(Figure|FIGURE)\\s*([0-9]+)\\W?\\s*(.*)$
+
+           Примеры:
+               "Figure 1 Caption..."
+               "Figure1 Caption..."
+               "FIGURE3| Sometextwithoutspaces..."
+               "FIGURE2) Moretext..."
+
+       Паттерн 2 (Fig):
+           ^\\s*(Fig\\.?|FIG\\.?)\\s*([0-9]+)\\W?\\s*(.*)$
+
+           Примеры:
+               "Fig. 2 Caption..."
+               "Fig2 Caption..."
+               "FIG3) Anothercaption..."
+
+       Где:
+           ([0-9]+) — номер рисунка;
+           (.*) — хвост первой строки подписи (может быть пустым).
+
+    3) Как только нашли такую строку — считаем, что это НАЧАЛО подписи.
+       Далее захватываем последующие строки в ту же подпись, пока:
+
+           - не встретили пустую строку (разделитель блоков), ИЛИ
+           - не встретили новую строку, начинающуюся с Figure/Fig для следующего рисунка.
+
+       В caption кладём ВСЕ строки подписи, склеенные пробелами.
+    """
+
+    figures: List[Dict[str, Union[int, str]]] = []
+
+    # Если pdfplumber недоступен — тихо выходим, дальше сработает fallback.
+    if pdfplumber is None:
+        return figures
+
+    # 1) Читаем текст построчно со всех страниц
+    try:
+        all_lines: List[str] = []
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page in pdf.pages:
+                text_page = page.extract_text() or ""
+                if not isinstance(text_page, str):
+                    continue
+                all_lines.extend(text_page.splitlines())
+    except Exception:
+        # Не ломаем общий парсинг, просто отдаём пустой список фигур.
+        return figures
+
+    # 2) Регулярки для первой строки подписи
+    pattern_figure = re.compile(r"^\s*(Figure|FIGURE)\s*([0-9]+)\W?\s*(.*)$")
+    pattern_fig = re.compile(r"^\s*(Fig\.?|FIG\.?)\s*([0-9]+)\W?\s*(.*)$")
+
+    seen_numbers: set[int] = set()
+
+    n = len(all_lines)
+    i = 0
+    while i < n:
+        line = all_lines[i]
+        if not isinstance(line, str):
+            i += 1
+            continue
+
+        s = line.strip()
+        if not s:
+            i += 1
+            continue
+
+        m = pattern_figure.match(s)
+        if not m:
+            m = pattern_fig.match(s)
+        if not m:
+            i += 1
+            continue
+
+        # Есть старт подписи
+        num_str = m.group(2)
+        try:
+            num = int(num_str)
+        except ValueError:
+            i += 1
+            continue
+
+        if num in seen_numbers:
+            # Уже брали подпись для этого номера — пропускаем
+            i += 1
+            continue
+        seen_numbers.add(num)
+
+        # 3) Собираем все последующие строки, пока не встретили пустую
+        #    или следующую Figure/Fig
+                # Определяем "компактный режим": первая строка подписи почти без пробелов
+        # (типичный случай FIGURE3|... без пробелов между словами).
+        first_spaces = s.count(" ")
+        compact_mode = first_spaces <= 1
+
+        caption_lines = [s]
+        j = i + 1
+        while j < n:
+            line2 = all_lines[j]
+            if not isinstance(line2, str):
+                j += 1
+                continue
+
+            s2 = line2.strip()
+            if not s2:
+                # Пустая строка — конец подписи
+                break
+
+            # Новая подпись к следующей фигуре — тоже стоп
+            if pattern_figure.match(s2) or pattern_fig.match(s2):
+                break
+
+            # Если мы в "компактном режиме" (подпись без пробелов),
+            # то прекращаем подпись, как только встречаем строку
+            # с "нормальным" количеством пробелов — это уже обычный текст статьи.
+            if compact_mode:
+                spaces2 = s2.count(" ")
+                if spaces2 > 1:
+                    break
+
+            caption_lines.append(s2)
+            j += 1
+
+        caption_full = " ".join(caption_lines).strip()
+
+        figures.append(
+            {
+                "figure_number": num,
+                "caption": caption_full,
+            }
+        )
+
+        # Перепрыгиваем на конец текущей подписи
+        i = j
     return figures
 
 
@@ -293,7 +469,6 @@ def _extract_figures(article: Dict[str, Any]) -> List[Dict[str, Union[int, str]]
 def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
     """
     Парсит PDF в структурированный объект (который потом конвертируется в JSON).
-    НЕ использует pdf_extract_title_year, а строит свою логику.
     """
 
     path = Path(pdf_path)
@@ -328,7 +503,7 @@ def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
     if year is not None:
         result["year"] = year
 
-        # ---- Sections ----
+    # ---- Sections ----
     sections = _collect_sections(article)
     if not sections:
         # Нечего делить, возвращаем только title/year/figures
@@ -447,10 +622,13 @@ def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
     result["results"] = results_sections
 
     # ---- Figures ----
-    result["figures"] = _extract_figures(article)
+    figures_pdf = _extract_figures_from_pdf_text(path)
+    if figures_pdf:
+        result["figures"] = figures_pdf
+    else:
+        result["figures"] = _extract_figures(article)
 
     return result
-
 
 # ---------- Сохранение и CLI ----------
 

@@ -70,8 +70,6 @@ def main():
     else:
         print("[WARN] Не удалось найти разделы текста (sections/body_text пусты или отсутствуют).")
 
-    print("\n[STATUS] Окружение scipdf + GROBID работает. Можно переходить к разработке парсеров.")
-
 
 if __name__ == "__main__":
     main()
