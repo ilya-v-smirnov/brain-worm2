@@ -56,9 +56,9 @@ except Exception:
 from scipdf import parse_pdf_to_dict
 
 try:
-    import pdfplumber  # type: ignore[import]
+    from pypdf import PdfReader  # type: ignore[import]
 except Exception:  # ModuleNotFoundError, ImportError, etc.
-    pdfplumber = None  # type: ignore[assignment]
+    PdfReader = None  # type: ignore[assignment]
 
 
 YEAR_MIN = 1980
@@ -318,6 +318,46 @@ def _extract_figures(article: Dict[str, Any]) -> List[Dict[str, Union[int, str]]
     return figures
 
 
+def _is_footer_or_noise_line(s: str) -> bool:
+    """
+    Эвристика: строка, похожая на колонтитул/служебный мусор,
+    которую не стоит включать в подпись к рисунку.
+    """
+    s = s.strip()
+    if not s:
+        return False
+
+    low = s.lower()
+
+    # Явные маркеры скачивания/URL/служебных сообщений журнала
+    if "downloaded from" in low:
+        return True
+    if "all rights reserved" in low:
+        return True
+    if "copyright" in low:
+        return True
+    if "doi:" in low:
+        return True
+    if "http://" in low or "https://" in low or "www." in low:
+        return True
+
+    # Частый паттерн: "VOLUME 119, NUMBER 13" и т.п.
+    if "volume" in low and "number" in low:
+        return True
+
+    # Общий случай: строка вида "3088 ALOULOU et al BLOOD, 29 MARCH 2012 VOLUME 119, NUMBER 13"
+    # — много ВЕРХНЕГО регистра + есть цифры.
+    letters = re.sub(r"[^A-Za-z]", "", s)
+    if letters:
+        upper = sum(1 for c in letters if c.isupper())
+        ratio = upper / len(letters)
+        if ratio >= 0.8 and any(ch.isdigit() for ch in s):
+            return True
+
+    return False
+
+
+
 def _extract_figures_from_pdf_text(pdf_path: Path) -> List[Dict[str, Union[int, str]]]:
     """
     Извлекает подписи к рисункам, читая текст PDF напрямую через pdfplumber.
@@ -359,22 +399,23 @@ def _extract_figures_from_pdf_text(pdf_path: Path) -> List[Dict[str, Union[int, 
 
     figures: List[Dict[str, Union[int, str]]] = []
 
-    # Если pdfplumber недоступен — тихо выходим, дальше сработает fallback.
-    if pdfplumber is None:
+    # Если PdfReader недоступен — тихо выходим, дальше сработает fallback.
+    if PdfReader is None:
         return figures
 
     # 1) Читаем текст построчно со всех страниц
     try:
         all_lines: List[str] = []
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            for page in pdf.pages:
-                text_page = page.extract_text() or ""
-                if not isinstance(text_page, str):
-                    continue
-                all_lines.extend(text_page.splitlines())
+        reader = PdfReader(str(pdf_path))
+        for page in reader.pages:
+            text_page = page.extract_text() or ""
+            if not isinstance(text_page, str):
+                continue
+            all_lines.extend(text_page.splitlines())
     except Exception:
         # Не ломаем общий парсинг, просто отдаём пустой список фигур.
         return figures
+
 
     # 2) Регулярки для первой строки подписи
     pattern_figure = re.compile(r"^\s*(Figure|FIGURE)\s*([0-9]+)\W?\s*(.*)$")
@@ -402,6 +443,12 @@ def _extract_figures_from_pdf_text(pdf_path: Path) -> List[Dict[str, Union[int, 
             i += 1
             continue
 
+        tail = m.group(3) or ""
+        tail = tail.lstrip() 
+        if tail.startswith(","):
+            i += 1
+            continue
+
         # Есть старт подписи
         num_str = m.group(2)
         try:
@@ -409,6 +456,7 @@ def _extract_figures_from_pdf_text(pdf_path: Path) -> List[Dict[str, Union[int, 
         except ValueError:
             i += 1
             continue
+
 
         if num in seen_numbers:
             # Уже брали подпись для этого номера — пропускаем
@@ -423,9 +471,16 @@ def _extract_figures_from_pdf_text(pdf_path: Path) -> List[Dict[str, Union[int, 
         first_spaces = s.count(" ")
         compact_mode = first_spaces <= 1
 
+                # Определяем "компактный режим": первая строка подписи почти без пробелов
+        first_spaces = s.count(" ")
+        compact_mode = first_spaces <= 1
+
         caption_lines = [s]
         j = i + 1
-        while j < n:
+
+        MAX_CAPTION_LINES = 30  # мягкий лимит на длину подписи
+
+        while j < n and len(caption_lines) < MAX_CAPTION_LINES:
             line2 = all_lines[j]
             if not isinstance(line2, str):
                 j += 1
@@ -436,13 +491,16 @@ def _extract_figures_from_pdf_text(pdf_path: Path) -> List[Dict[str, Union[int, 
                 # Пустая строка — конец подписи
                 break
 
-            # Новая подпись к следующей фигуре — тоже стоп
+            # Новая подпись к следующей фигуре — стоп
             if pattern_figure.match(s2) or pattern_fig.match(s2):
                 break
 
-            # Если мы в "компактном режиме" (подпись без пробелов),
-            # то прекращаем подпись, как только встречаем строку
-            # с "нормальным" количеством пробелов — это уже обычный текст статьи.
+            # Служебные строки журнала / колонтитулы — не включаем в подпись
+            if _is_footer_or_noise_line(s2):
+                break
+
+            # "Компактный режим": первая строка подписи без пробелов,
+            # заканчиваем, когда пошёл "обычный" текст статьи.
             if compact_mode:
                 spaces2 = s2.count(" ")
                 if spaces2 > 1:
@@ -450,6 +508,7 @@ def _extract_figures_from_pdf_text(pdf_path: Path) -> List[Dict[str, Union[int, 
 
             caption_lines.append(s2)
             j += 1
+
 
         caption_full = " ".join(caption_lines).strip()
 
@@ -625,8 +684,8 @@ def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
     figures_pdf = _extract_figures_from_pdf_text(path)
     if figures_pdf:
         result["figures"] = figures_pdf
-    else:
-        result["figures"] = _extract_figures(article)
+    # else:
+    #     result["figures"] = _extract_figures(article)
 
     return result
 
