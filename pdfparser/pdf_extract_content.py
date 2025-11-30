@@ -180,6 +180,17 @@ def _classify_section_title(norm_title: str) -> str:
 
     return "other"
 
+def _is_ignored_tail_section(sec: SectionInfo) -> bool:
+    """
+    Секции, которые не должны попадать в Results/основные результаты:
+    ACKNOWLEDGMENTS и т.п.
+    """
+    title = (sec.norm_title or sec.clean_title or "").upper()
+    # Можно расширять по мере появления кейсов
+    if "ACKNOWLEDGMENT" in title or "ACKNOWLEDGEMENTS" in title or "ACKNOWLEDGMENTS" in title:
+        return True
+    return False
+
 
 def _collect_sections(article: Dict[str, Any]) -> List[SectionInfo]:
     """
@@ -645,12 +656,13 @@ def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
     disc_first_idx = first_discussion_idx
 
     if has_explicit_results:
-        # 1) Явный блок Results + все "подразделы" до Discussion
         for sec in sections:
             if sec.index < res_first_idx:
                 continue
             if disc_first_idx is not None and sec.index >= disc_first_idx:
                 continue
+            if _is_ignored_tail_section(sec):
+                continue  # <-- новая строка
             if sec.section_type in ("results", "other") and sec.text.strip():
                 title = sec.clean_title or "Results"
                 results_sections.append(
@@ -660,8 +672,6 @@ def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
                     }
                 )
     else:
-        # 2) Нет явных Results: если есть intro и discussion,
-        #    всё между ними (кроме intro/methods/discussion) считаем Results-подразделами.
         if result["introduction"] and result["discussion"] and discussion_indices:
             disc_first_idx = min(discussion_indices)
             for sec in sections:
@@ -669,6 +679,8 @@ def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
                     continue
                 if sec.index >= disc_first_idx:
                     continue
+                if _is_ignored_tail_section(sec):
+                    continue  # <-- новая строка
                 if sec.section_type not in ("intro", "methods", "discussion") and sec.text.strip():
                     title = sec.clean_title or "Results"
                     results_sections.append(
