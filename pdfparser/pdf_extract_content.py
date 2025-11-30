@@ -684,8 +684,8 @@ def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
     figures_pdf = _extract_figures_from_pdf_text(path)
     if figures_pdf:
         result["figures"] = figures_pdf
-    # else:
-    #     result["figures"] = _extract_figures(article)
+    else:
+        result["figures"] = _extract_figures(article)
 
     return result
 
