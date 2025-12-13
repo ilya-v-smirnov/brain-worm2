@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+import tkinter as tk
+from tkinter import messagebox
+from tkinter import ttk
+
+from gui.db_gateway import DbGateway, FileRow
+from gui.extracted_text_dialog import ExtractedTextDialog
+from gui.file_ops import open_file
+from gui.rename_new_pdfs_dialog import RenameNewPdfsDialog
+
+CHECK = "✓"
+DASH = "-"
+
+
+class MainWindow:
+    def __init__(self, master: tk.Tk) -> None:
+        self.master = master
+        self.db = DbGateway()
+        self._iid_to_payload: dict[str, dict] = {}
+
+        self._build_layout()
+        self._startup_pipeline()
+
+    def _build_layout(self) -> None:
+        self.master.geometry("1100x700")
+
+        root = ttk.Frame(self.master, padding=10)
+        root.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(root)
+        top.pack(fill=tk.X)
+
+        ttk.Button(top, text="Rename New PDFs", command=self._on_rename_new).pack(side=tk.LEFT)
+        ttk.Button(top, text="Refresh database", command=self._on_refresh_db).pack(side=tk.LEFT, padx=(10, 0))
+
+        tree_frame = ttk.Frame(root)
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 10))
+
+        columns = ("summary", "lecture", "audio")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", selectmode="browse")
+
+        self.tree.heading("#0", text="Article Database")
+        self.tree.heading("summary", text="Summary")
+        self.tree.heading("lecture", text="Lecture")
+        self.tree.heading("audio", text="Audio")
+
+        self.tree.column("#0", width=720, stretch=True)
+        self.tree.column("summary", width=90, anchor=tk.CENTER, stretch=False)
+        self.tree.column("lecture", width=90, anchor=tk.CENTER, stretch=False)
+        self.tree.column("audio", width=90, anchor=tk.CENTER, stretch=False)
+
+        yscroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=yscroll.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        bottom = ttk.Frame(root)
+        bottom.pack(fill=tk.X)
+
+        ttk.Frame(bottom).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(bottom, text="Generate Summary", command=lambda: self._on_generate("summary")).pack(side=tk.RIGHT)
+        ttk.Button(bottom, text="Generate Lecture", command=lambda: self._on_generate("lecture")).pack(side=tk.RIGHT, padx=(10, 0))
+        ttk.Button(bottom, text="Generate Audio", command=lambda: self._on_generate("audio")).pack(side=tk.RIGHT, padx=(10, 0))
+
+        self.status_var = tk.StringVar(value="Starting…")
+        ttk.Label(root, textvariable=self.status_var, anchor="w").pack(fill=tk.X, pady=(8, 0))
+
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+        # Context menu (ПКМ)
+        self._ctx = tk.Menu(self.master, tearoff=False)
+        self._ctx.add_command(label="View extracted text", command=self._on_view_extracted_text)
+        self.tree.bind("<Button-3>", self._on_right_click)
+
+    # ---------------- Startup pipeline ----------------
+
+    def _startup_pipeline(self) -> None:
+        self._set_status("Initializing database…")
+        self.db.init_db_schema()
+
+        self._set_status("Syncing Article Database…")
+        self.db.sync_article_database()
+
+        self._set_status("Extracting JSON for new articles…")
+        self.db.extract_contents_for_new_articles()
+
+        self._set_status("Building tree…")
+        self._reload_tree()
+
+        self._set_status("Ready")
+
+    # ---------------- Tree building ----------------
+
+    def _reload_tree(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self._iid_to_payload.clear()
+
+        rows = self.db.fetch_file_rows()
+
+        folder_iids: dict[str, str] = {}
+
+        def ensure_folder(parent_iid: str, folder_key: str, name: str) -> str:
+            if folder_key in folder_iids:
+                return folder_iids[folder_key]
+            iid = self.tree.insert(parent_iid, "end", text=name, values=("", "", ""))
+            self._iid_to_payload[iid] = {"type": "folder", "key": folder_key}
+            folder_iids[folder_key] = iid
+            return iid
+
+        for row in rows:
+            self._insert_pdf_row(row, ensure_folder)
+
+    def _insert_pdf_row(self, row: FileRow, ensure_folder) -> None:
+        parts = row.pdf_path.split("/")
+        if not parts:
+            return
+
+        parent_key = ""
+        parent_iid = ""
+        for seg in parts[:-1]:
+            parent_key = f"{parent_key}/{seg}" if parent_key else seg
+            parent_iid = ensure_folder(parent_iid, parent_key, seg)
+
+        filename = parts[-1]
+        summary = CHECK if row.summary_path else DASH
+        lecture = CHECK if row.lecture_text_path else DASH
+        audio = CHECK if row.lecture_audio_path else DASH
+
+        iid = self.tree.insert(parent_iid, "end", text=filename, values=(summary, lecture, audio))
+        self._iid_to_payload[iid] = {
+            "type": "pdf",
+            "article_id": row.article_id,
+            "pdf_path": row.pdf_path,
+            "summary_path": row.summary_path,
+            "lecture_text_path": row.lecture_text_path,
+            "lecture_audio_path": row.lecture_audio_path,
+        }
+
+    # ---------------- Handlers ----------------
+
+    def _on_refresh_db(self) -> None:
+        try:
+            self._set_status("Syncing Article Database…")
+            self.db.sync_article_database()
+            self._set_status("Extracting JSON for new articles…")
+            self.db.extract_contents_for_new_articles()
+            self._set_status("Building tree…")
+            self._reload_tree()
+            self._set_status("Database updated")
+        except Exception as e:
+            messagebox.showerror("Refresh error", f"{type(e).__name__}: {e}")
+            self._set_status("Error")
+
+    def _on_rename_new(self) -> None:
+        RenameNewPdfsDialog(self.master)
+
+    def _on_generate(self, kind: str) -> None:
+        payload = self._get_selected_payload()
+        if not payload or payload.get("type") != "pdf":
+            messagebox.showwarning("Generate", "Select an article PDF first.")
+            return
+        messagebox.showinfo("Generate", "Not implemented yet")
+
+    def _on_double_click(self, event: tk.Event) -> None:
+        iid = self.tree.focus()
+        payload = self._iid_to_payload.get(iid)
+        if not payload or payload.get("type") != "pdf":
+            return
+
+        col = self.tree.identify_column(event.x)  # '#0', '#1', '#2', '#3'
+
+        def open_rel(rel_or_abs: str | None) -> None:
+            if not rel_or_abs:
+                return
+            p = self.db.resolve_path(rel_or_abs)
+            open_file(p)
+
+        if col == "#0":
+            open_rel(payload.get("pdf_path"))
+        elif col == "#1":
+            open_rel(payload.get("summary_path"))
+        elif col == "#2":
+            open_rel(payload.get("lecture_text_path"))
+        elif col == "#3":
+            open_rel(payload.get("lecture_audio_path"))
+
+    def _on_right_click(self, event: tk.Event) -> None:
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+
+        payload = self._iid_to_payload.get(iid)
+        if not payload or payload.get("type") != "pdf":
+            return
+
+        try:
+            self._ctx.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx.grab_release()
+
+    def _on_view_extracted_text(self) -> None:
+        payload = self._get_selected_payload()
+        if not payload or payload.get("type") != "pdf":
+            messagebox.showwarning("View extracted text", "Select an article PDF first.")
+            return
+
+        try:
+            json_rel = self.db.fetch_json_path_for_article(int(payload["article_id"]))
+        except Exception as e:
+            messagebox.showerror("View extracted text", f"{type(e).__name__}: {e}")
+            return
+
+        if not json_rel:
+            messagebox.showwarning("View extracted text", "No extracted JSON for this article yet.")
+            return
+
+        json_path = self.db.resolve_path(json_rel)
+        pdf_path = self.db.resolve_path(payload["pdf_path"])
+        ExtractedTextDialog(self.master, json_path=json_path, pdf_path=pdf_path)
+
+    # ---------------- Utils ----------------
+
+    def _get_selected_payload(self) -> dict | None:
+        return self._iid_to_payload.get(self.tree.focus())
+
+    def _set_status(self, text: str) -> None:
+        self.status_var.set(text)
+        self.master.update_idletasks()

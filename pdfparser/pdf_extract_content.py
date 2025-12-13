@@ -138,6 +138,82 @@ def _normalize_heading(heading: str) -> Tuple[str, str]:
     return clean_title, norm_title
 
 
+def _split_result_section_into_subsections(
+    section_title: str, section_text: str
+) -> Optional[List[Dict[str, str]]]:
+    """
+    Пытается разбить один большой блок результатов на несколько подпунктов
+    по параграфам (строкам section_text.splitlines()).
+
+    Возвращает список словарей {"section_title": ..., "section_text": ...}
+    или None, если разбиение не требуется/не удалось.
+    """
+    if not section_text:
+        return None
+
+    # Параграфы — непустые строки
+    paragraphs = [p.strip() for p in section_text.splitlines() if p.strip()]
+    if len(paragraphs) <= 1:
+        # Нечего делить
+        return None
+
+    # Нормализуем заголовок и первый параграф — проверим, что title реально "происходит" из текста
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    first_para = paragraphs[0]
+    norm_title = _norm(section_title)
+    norm_first_para = _norm(first_para)
+
+    # Если заголовок никак не соотносится с первым параграфом,
+    # лучше не трогать (для реальных заголовков из scipdf)
+    # Требуем, чтобы хотя бы первые ~10 символов совпадали.
+    if norm_title and not norm_first_para.startswith(norm_title[: max(10, len(norm_title) - 3)]):
+        return None
+
+    subsections: List[Dict[str, str]] = []
+
+    # Первый подпункт — исходный заголовок и первый параграф
+    subsections.append(
+        {
+            "section_title": section_title,
+            "section_text": first_para,
+        }
+    )
+
+    # Остальные параграфы — отдельные подпункты, если удаётся вытащить внятный "подзаголовок"
+    for para in paragraphs[1:]:
+        # Слишком короткие параграфы (вероятно, хвосты или фразы) — приклеиваем к предыдущему
+        if len(para) < 80:
+            subsections[-1]["section_text"] += "\n\n" + para
+            continue
+
+        # Подзаголовок — первая фраза до точки/вопроса/восклицания (но не слишком короткая)
+        m = re.search(r"[.!?](\s|$)", para)
+        if m and m.start() > 40:
+            candidate_title = para[: m.start() + 1].strip()
+        else:
+            candidate_title = para[: min(150, len(para))].strip()
+
+        # Требуем, чтобы подзаголовок был "осмысленным": хотя бы 4 слова
+        if len(candidate_title.split()) < 4:
+            subsections[-1]["section_text"] += "\n\n" + para
+            continue
+
+        subsections.append(
+            {
+                "section_title": candidate_title,
+                "section_text": para,
+            }
+        )
+
+    # Если так и остался один подпункт — смысла нет
+    if len(subsections) <= 1:
+        return None
+
+    return subsections
+
+
 def _classify_section_title(norm_title: str) -> str:
     """
     Классификация секции по нормализованному заголовку.
@@ -690,7 +766,17 @@ def parse_pdf_content(pdf_path: Union[str, Path]) -> Dict[str, Any]:
                         }
                     )
 
-    result["results"] = results_sections
+    expanded_results: List[Dict[str, str]] = []
+    for item in results_sections:
+        title = item.get("section_title") or ""
+        text = item.get("section_text") or ""
+        splitted = _split_result_section_into_subsections(title, text)
+        if splitted:
+            expanded_results.extend(splitted)
+        else:
+            expanded_results.append(item)
+
+        result["results"] = results_sections
 
     # ---- Figures ----
     figures_pdf = _extract_figures_from_pdf_text(path)
