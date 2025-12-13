@@ -124,6 +124,9 @@ class ExtractedTextDialog(tk.Toplevel):
         self.figures_canvas, self.figures_inner = self._make_scrollable_tab(self.tab_figures)
         self._build_figures_inner(self.figures_inner)
 
+        self._setup_mousewheel_routing()
+
+
         bottom = ttk.Frame(root)
         bottom.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         bottom.columnconfigure(0, weight=1)
@@ -147,6 +150,8 @@ class ExtractedTextDialog(tk.Toplevel):
 
         txt.grid(row=0, column=0, sticky="nsew")
         scr.grid(row=0, column=1, sticky="ns")
+
+        self._setup_paragraph_spacing(txt)
         return txt
 
     def _make_scrollable_tab(self, parent: ttk.Frame) -> tuple[tk.Canvas, ttk.Frame]:
@@ -178,23 +183,69 @@ class ExtractedTextDialog(tk.Toplevel):
         canvas.bind("<Configure>", on_canvas_configure)
 
         # mouse wheel support when cursor over tab
-        def _on_mousewheel(event: tk.Event) -> None:
-            # On Linux, delta is usually 120/-120 via event.num 4/5 or event.delta in some envs
-            if getattr(event, "num", None) == 4:
-                canvas.yview_scroll(-1, "units")
-            elif getattr(event, "num", None) == 5:
-                canvas.yview_scroll(1, "units")
-            else:
-                delta = getattr(event, "delta", 0)
-                if delta:
-                    canvas.yview_scroll(int(-delta / 120), "units")
-
-        canvas.bind_all("<Button-4>", _on_mousewheel)
-        canvas.bind_all("<Button-5>", _on_mousewheel)
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         return canvas, inner
 
+    
+    def _is_descendant(self, widget: tk.Widget | None, ancestor: tk.Widget) -> bool:
+        """True if widget is ancestor itself or inside it."""
+        w = widget
+        while w is not None:
+            if w == ancestor:
+                return True
+            w = w.master  # type: ignore[assignment]
+        return False
+
+    def _setup_mousewheel_routing(self) -> None:
+        """
+        Mouse wheel routing rules (Linux/Windows/macOS-friendly):
+        - If pointer is over a tk.Text: scroll that Text.
+        - Else if pointer is inside Results scrollable area: scroll Results canvas.
+        - Else if pointer is inside Figures scrollable area: scroll Figures canvas.
+        """
+        if getattr(self, "_mousewheel_routing_installed", False):
+            return
+        self._mousewheel_routing_installed = True
+
+        def _on_wheel(event: tk.Event) -> str | None:
+            # Identify widget under pointer reliably
+            w = self.winfo_containing(event.x_root, event.y_root)
+            if isinstance(w, tk.Text):
+                # Linux wheel buttons
+                if event.num == 4:
+                    w.yview_scroll(-1, "units")
+                elif event.num == 5:
+                    w.yview_scroll(1, "units")
+                else:
+                    delta = getattr(event, "delta", 0)
+                    if delta:
+                        w.yview_scroll(int(-delta / 120), "units")
+                return "break"
+
+            # Prefer scrolling the tab-level canvas when not over Text
+            target_canvas: tk.Canvas | None = None
+            if hasattr(self, "results_canvas") and self._is_descendant(w, self.results_canvas):
+                target_canvas = self.results_canvas
+            elif hasattr(self, "figures_canvas") and self._is_descendant(w, self.figures_canvas):
+                target_canvas = self.figures_canvas
+
+            if target_canvas is None:
+                return None
+
+            if event.num == 4:
+                target_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                target_canvas.yview_scroll(1, "units")
+            else:
+                delta = getattr(event, "delta", 0)
+                if delta:
+                    target_canvas.yview_scroll(int(-delta / 120), "units")
+            return "break"
+
+        # Linux: Button-4/5. Windows/macOS: MouseWheel.
+        self.bind_all("<Button-4>", _on_wheel)
+        self.bind_all("<Button-5>", _on_wheel)
+        self.bind_all("<MouseWheel>", _on_wheel)
     def _build_results_inner(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Result sections:", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
 
@@ -202,7 +253,10 @@ class ExtractedTextDialog(tk.Toplevel):
         self.results_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
     def _build_figures_inner(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Figures:", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+        header = ttk.Frame(parent)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="Figures:", font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT, anchor="w")
+        ttk.Button(header, text="Order", command=self._order_figures_by_number).pack(side=tk.RIGHT)
 
         self.figures_frame = ttk.Frame(parent)
         self.figures_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -283,7 +337,93 @@ class ExtractedTextDialog(tk.Toplevel):
     def _get_text(widget: tk.Text) -> str:
         return widget.get("1.0", tk.END).rstrip("\n")
 
-    # ---------------- Dynamic blocks: Results ----------------
+    
+    # ---------------- Text formatting helpers ----------------
+
+    def _setup_paragraph_spacing(self, widget: tk.Text) -> None:
+        """
+        Visually separate paragraphs by adding extra spacing around empty lines.
+
+        Implementation detail: we tag blank lines with spacing1/spacing3.
+        """
+        widget.tag_configure("blankline", spacing1=10, spacing3=10)
+
+        def _on_modified(event: tk.Event) -> None:
+            w: tk.Text = event.widget  # type: ignore[assignment]
+            if not w.edit_modified():
+                return
+            self._retag_blank_lines(w)
+            w.edit_modified(False)
+
+        widget.bind("<<Modified>>", _on_modified, add=True)
+        self._retag_blank_lines(widget)
+
+    def _retag_blank_lines(self, widget: tk.Text) -> None:
+        widget.tag_remove("blankline", "1.0", tk.END)
+        end_idx = widget.index("end-1c")
+        try:
+            last_line = int(end_idx.split(".")[0])
+        except Exception:
+            return
+
+        for line in range(1, last_line + 1):
+            line_start = f"{line}.0"
+            line_end = f"{line}.end"
+            txt = widget.get(line_start, line_end)
+            if txt.strip() == "":
+                widget.tag_add("blankline", line_start, line_end)
+
+    def _setup_figure_caption_behavior(self, widget: tk.Text) -> None:
+        """Force captions to be a single paragraph: remove all newline characters."""
+        widget.tag_configure("blankline", spacing1=10, spacing3=10)
+
+        def _on_modified(event: tk.Event) -> None:
+            w: tk.Text = event.widget  # type: ignore[assignment]
+            if not w.edit_modified():
+                return
+
+            # Normalize newlines into spaces
+            raw = w.get("1.0", tk.END).rstrip("\n")
+            normalized = " ".join(raw.replace("\n", " ").split())
+            if normalized != raw.strip():
+                # Preserve cursor as best we can
+                try:
+                    insert = w.index(tk.INSERT)
+                except Exception:
+                    insert = "1.0"
+                w.delete("1.0", tk.END)
+                w.insert("1.0", normalized)
+                try:
+                    w.mark_set(tk.INSERT, insert)
+                except Exception:
+                    pass
+
+            self._retag_blank_lines(w)
+            w.edit_modified(False)
+
+        widget.bind("<<Modified>>", _on_modified, add=True)
+        self._retag_blank_lines(widget)
+
+    def _order_figures_by_number(self) -> None:
+        """Sort figure blocks by figure number (ascending). Non-numeric / empty go last."""
+        def _key(w: _FigureWidgets) -> tuple[int, int]:
+            raw = w.number_var.get().strip()
+            try:
+                return (0, int(raw))
+            except Exception:
+                return (1, 10**9)
+
+        self._figure_widgets.sort(key=_key)
+
+        for w in self._figure_widgets:
+            w.frame.pack_forget()
+        for w in self._figure_widgets:
+            w.frame.pack(fill=tk.X, expand=True)
+
+        self.figures_canvas.update_idletasks()
+        self.figures_canvas.configure(scrollregion=self.figures_canvas.bbox("all"))
+
+# ---------------- Dynamic blocks: Results ----------------
 
     
     def _add_result_section(
@@ -319,7 +459,7 @@ class ExtractedTextDialog(tk.Toplevel):
         left.columnconfigure(1, weight=1)
 
         right = ttk.Frame(frame)
-        right.grid(row=0, column=1, sticky="n", padx=(10, 0))
+        right.grid(row=0, column=1, sticky="n", padx=(10, 12))
 
         # Subtitle row
         title_var = tk.StringVar(value=section_title)
@@ -338,6 +478,7 @@ class ExtractedTextDialog(tk.Toplevel):
         left.rowconfigure(1, weight=1)
 
         self._set_text(txt, section_text)
+        self._setup_paragraph_spacing(txt)
 
         w = _ResultSectionWidgets(frame=frame, title_var=title_var, title_entry=title_entry, text=txt)
 
@@ -425,7 +566,7 @@ class ExtractedTextDialog(tk.Toplevel):
         left.columnconfigure(1, weight=1)
 
         right = ttk.Frame(frame)
-        right.grid(row=0, column=1, sticky="n", padx=(10, 0))
+        right.grid(row=0, column=1, sticky="n", padx=(10, 12))
 
         num_var = tk.StringVar(value=figure_number)
         ttk.Label(left, text="Figure number:").grid(row=0, column=0, sticky="w")
@@ -443,6 +584,7 @@ class ExtractedTextDialog(tk.Toplevel):
         left.rowconfigure(1, weight=1)
 
         self._set_text(cap, caption)
+        self._setup_figure_caption_behavior(cap)
 
         w = _FigureWidgets(frame=frame, number_var=num_var, number_entry=num_entry, caption=cap)
         self._figure_widgets.insert(list_index, w)
