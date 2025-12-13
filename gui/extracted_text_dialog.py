@@ -72,7 +72,14 @@ class ExtractedTextDialog(tk.Toplevel):
         header.columnconfigure(0, weight=1)
 
         ttk.Label(header, text="Extracted text", font=("TkDefaultFont", 12, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="Open PDF", command=self._on_open_pdf).grid(row=0, column=1, sticky="e")
+
+        actions = ttk.Frame(header)
+        actions.grid(row=0, column=1, sticky="e")
+
+        ttk.Button(actions, text="Extract text again", command=self._on_extract_text_again).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text="Copy text", command=self._copy_text_from_disk).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text="Copy JSON", command=self._copy_json_from_disk).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text="Open PDF", command=self._on_open_pdf).pack(side=tk.LEFT)
 
         common = ttk.Frame(root)
         common.grid(row=1, column=0, sticky="ew", pady=(10, 6))
@@ -93,6 +100,8 @@ class ExtractedTextDialog(tk.Toplevel):
         self.tab_intro = ttk.Frame(self.nb, padding=10)
         self.tab_methods = ttk.Frame(self.nb, padding=10)
 
+        self.tab_discussion = ttk.Frame(self.nb, padding=10)
+
         # Scrollable tabs for Results/Figures
         self.tab_results = ttk.Frame(self.nb, padding=0)
         self.tab_figures = ttk.Frame(self.nb, padding=0)
@@ -100,10 +109,12 @@ class ExtractedTextDialog(tk.Toplevel):
         self.nb.add(self.tab_intro, text="Introduction")
         self.nb.add(self.tab_methods, text="Methods")
         self.nb.add(self.tab_results, text="Results")
+        self.nb.add(self.tab_discussion, text="Discussion")
         self.nb.add(self.tab_figures, text="Figures")
 
         self.intro_text = self._text_area(self.tab_intro)
         self.methods_text = self._text_area(self.tab_methods)
+        self.discussion_text = self._text_area(self.tab_discussion)
 
         # Results: scrollable
         self.results_canvas, self.results_inner = self._make_scrollable_tab(self.tab_results)
@@ -117,7 +128,8 @@ class ExtractedTextDialog(tk.Toplevel):
         bottom.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         bottom.columnconfigure(0, weight=1)
 
-        ttk.Button(bottom, text="Cancel", command=self._on_cancel).grid(row=0, column=2, sticky="e")
+        ttk.Button(bottom, text="Cancel", command=self._on_cancel).grid(row=0, column=3, sticky="e")
+        ttk.Button(bottom, text="Save & Close", command=self._on_save_and_close).grid(row=0, column=2, sticky="e", padx=(0, 10))
         ttk.Button(bottom, text="Save", command=self._on_save).grid(row=0, column=1, sticky="e", padx=(0, 10))
 
     def _text_area(self, parent: ttk.Frame) -> tk.Text:
@@ -189,15 +201,11 @@ class ExtractedTextDialog(tk.Toplevel):
         self.results_frame = ttk.Frame(parent)
         self.results_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
-        ttk.Button(parent, text="Add section", command=self._add_result_section).pack(anchor="w", pady=(8, 0))
-
     def _build_figures_inner(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Figures:", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
 
         self.figures_frame = ttk.Frame(parent)
         self.figures_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-
-        ttk.Button(parent, text="Add figure", command=self._add_figure).pack(anchor="w", pady=(8, 0))
 
     # ---------------- Load/Populate ----------------
 
@@ -219,6 +227,7 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self._set_text(self.intro_text, str(self.original_data.get("introduction", "") or ""))
         self._set_text(self.methods_text, str(self.original_data.get("methods", "") or ""))
+        self._set_text(self.discussion_text, str(self.original_data.get("discussion", "") or ""))
 
         self._clear_results()
         results = self.original_data.get("results") or []
@@ -229,6 +238,11 @@ class ExtractedTextDialog(tk.Toplevel):
                         section_title=str(item.get("section_title", "") or ""),
                         section_text=str(item.get("section_text", "") or ""),
                     )
+
+
+        # If JSON has no result sections, keep one empty block for editing
+        if not self._result_widgets:
+            self._add_result_section()
 
         self._clear_figures()
         figures = self.original_data.get("figures") or []
@@ -241,17 +255,24 @@ class ExtractedTextDialog(tk.Toplevel):
                         caption=str(item.get("caption", "") or ""),
                     )
 
+
+        # If JSON has no figures, keep one empty block for editing
+        if not self._figure_widgets:
+            self._add_figure()
+
         # ensure scrollregion updated
         self.results_canvas.update_idletasks()
         self.figures_canvas.update_idletasks()
 
     def _clear_results(self) -> None:
         for w in list(self._result_widgets):
-            self._delete_result_section(w)
+            self._delete_result_section(w, keep_one=False)
+        self._result_widgets.clear()
 
     def _clear_figures(self) -> None:
         for w in list(self._figure_widgets):
-            self._delete_figure(w)
+            self._delete_figure(w, keep_one=False)
+        self._figure_widgets.clear()
 
     @staticmethod
     def _set_text(widget: tk.Text, value: str) -> None:
@@ -264,96 +285,202 @@ class ExtractedTextDialog(tk.Toplevel):
 
     # ---------------- Dynamic blocks: Results ----------------
 
-    def _add_result_section(self, section_title: str = "", section_text: str = "") -> None:
+    
+    def _add_result_section(
+        self,
+        section_title: str = "",
+        section_text: str = "",
+        insert_index: int | None = None,
+        focus_subtitle: bool = False,
+    ) -> None:
+        """
+        Add a Results section UI block.
+
+        If insert_index is provided, the new block is inserted BEFORE the block at that index.
+        """
         frame = ttk.Frame(self.results_frame, padding=(0, 8, 0, 8))
-        frame.pack(fill=tk.X, expand=True)
 
-        header = ttk.Frame(frame)
-        header.pack(fill=tk.X)
+        # Insert into UI + list
+        if insert_index is None or insert_index >= len(self._result_widgets):
+            frame.pack(fill=tk.X, expand=True)
+            list_index = len(self._result_widgets)
+        else:
+            before_frame = self._result_widgets[insert_index].frame
+            frame.pack(fill=tk.X, expand=True, before=before_frame)
+            list_index = insert_index
 
-        ttk.Label(header, text="Section", font=("TkDefaultFont", 9, "bold")).pack(side=tk.LEFT)
-        ttk.Button(header, text="Delete", command=lambda: self._delete_result_section(w)).pack(side=tk.RIGHT)
+        # Two-column layout: left content, right buttons
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=0)
 
+        left = ttk.Frame(frame)
+        left.grid(row=0, column=0, sticky="ew")
+        left.columnconfigure(0, weight=0)
+        left.columnconfigure(1, weight=1)
+
+        right = ttk.Frame(frame)
+        right.grid(row=0, column=1, sticky="n", padx=(10, 0))
+
+        # Subtitle row
         title_var = tk.StringVar(value=section_title)
-        row = ttk.Frame(frame)
-        row.pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(row, text="Section title:").pack(side=tk.LEFT)
-        title_entry = ttk.Entry(row, textvariable=title_var)
-        title_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        ttk.Label(left, text="Subtitle:").grid(row=0, column=0, sticky="w")
+        title_entry = ttk.Entry(left, textvariable=title_var)
+        title_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
-        box = ttk.Frame(frame)
-        box.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        # Text box (taller)
+        txt = tk.Text(left, wrap="word", height=9)
+        scr = ttk.Scrollbar(left, orient=tk.VERTICAL, command=txt.yview)
+        txt.configure(yscrollcommand=scr.set)
 
-        text_widget = tk.Text(box, height=6, wrap="word")
-        scr = ttk.Scrollbar(box, orient=tk.VERTICAL, command=text_widget.yview)
-        text_widget.configure(yscrollcommand=scr.set)
-        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scr.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+        scr.grid(row=1, column=2, sticky="ns", pady=(6, 0), padx=(6, 0))
+        left.columnconfigure(2, weight=0)
+        left.rowconfigure(1, weight=1)
 
-        self._set_text(text_widget, section_text)
+        self._set_text(txt, section_text)
 
-        w = _ResultSectionWidgets(frame=frame, title_var=title_var, title_entry=title_entry, text=text_widget)
-        for child in header.winfo_children():
-            if isinstance(child, ttk.Button) and child.cget("text") == "Delete":
-                child.configure(command=lambda w=w: self._delete_result_section(w))
-                break
+        w = _ResultSectionWidgets(frame=frame, title_var=title_var, title_entry=title_entry, text=txt)
 
-        self._result_widgets.append(w)
+        # Insert into list at computed position
+        self._result_widgets.insert(list_index, w)
+
+        # Button commands compute index dynamically (stable after insert/delete)
+        ttk.Button(
+            right,
+            text="Add above",
+            command=lambda w=w: self._add_result_section(
+                insert_index=self._result_widgets.index(w),
+                focus_subtitle=True,
+            ),
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(
+            right,
+            text="Delete",
+            command=lambda w=w: self._delete_result_section(w),
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(
+            right,
+            text="Add below",
+            command=lambda w=w: self._add_result_section(
+                insert_index=self._result_widgets.index(w) + 1,
+                focus_subtitle=True,
+            ),
+        ).pack(fill=tk.X)
 
         # update scroll region
         self.results_canvas.update_idletasks()
         self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
 
-    def _delete_result_section(self, w: _ResultSectionWidgets) -> None:
+        if focus_subtitle:
+            try:
+                title_entry.focus_set()
+            except Exception:
+                pass
+
+    def _delete_result_section(self, w: _ResultSectionWidgets, keep_one: bool = True) -> None:
         if w in self._result_widgets:
             self._result_widgets.remove(w)
         w.frame.destroy()
+
+        # Keep at least one empty section so the tab isn't "blank"
+        if keep_one and not self._result_widgets:
+            self._add_result_section()
+
         self.results_canvas.update_idletasks()
         self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
 
     # ---------------- Dynamic blocks: Figures ----------------
 
-    def _add_figure(self, figure_number: str = "", caption: str = "") -> None:
+    
+    def _add_figure(
+        self,
+        figure_number: str = "",
+        caption: str = "",
+        insert_index: int | None = None,
+        focus_number: bool = False,
+    ) -> None:
+        """
+        Add a Figure UI block.
+
+        If insert_index is provided, the new block is inserted BEFORE the block at that index.
+        """
         frame = ttk.Frame(self.figures_frame, padding=(0, 8, 0, 8))
-        frame.pack(fill=tk.X, expand=True)
 
-        header = ttk.Frame(frame)
-        header.pack(fill=tk.X)
+        if insert_index is None or insert_index >= len(self._figure_widgets):
+            frame.pack(fill=tk.X, expand=True)
+            list_index = len(self._figure_widgets)
+        else:
+            before_frame = self._figure_widgets[insert_index].frame
+            frame.pack(fill=tk.X, expand=True, before=before_frame)
+            list_index = insert_index
 
-        ttk.Button(header, text="Delete", command=lambda: self._delete_figure(w)).pack(side=tk.RIGHT)
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=0)
+
+        left = ttk.Frame(frame)
+        left.grid(row=0, column=0, sticky="ew")
+        left.columnconfigure(0, weight=0)
+        left.columnconfigure(1, weight=1)
+
+        right = ttk.Frame(frame)
+        right.grid(row=0, column=1, sticky="n", padx=(10, 0))
 
         num_var = tk.StringVar(value=figure_number)
-        row = ttk.Frame(frame)
-        row.pack(fill=tk.X)
-        ttk.Label(row, text="Figure number:").pack(side=tk.LEFT)
-        num_entry = ttk.Entry(row, textvariable=num_var, width=10)
-        num_entry.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(left, text="Figure number:").grid(row=0, column=0, sticky="w")
+        num_entry = ttk.Entry(left, textvariable=num_var, width=10)
+        num_entry.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
-        ttk.Label(frame, text="Caption:").pack(anchor="w", pady=(6, 0))
+        ttk.Label(left, text="Caption:").grid(row=1, column=0, sticky="nw", pady=(6, 0))
+        cap = tk.Text(left, wrap="word", height=8)
+        scr = ttk.Scrollbar(left, orient=tk.VERTICAL, command=cap.yview)
+        cap.configure(yscrollcommand=scr.set)
 
-        box = ttk.Frame(frame)
-        box.pack(fill=tk.BOTH, expand=True)
+        cap.grid(row=1, column=1, sticky="nsew", pady=(6, 0))
+        scr.grid(row=1, column=2, sticky="ns", pady=(6, 0), padx=(6, 0))
+        left.columnconfigure(2, weight=0)
+        left.rowconfigure(1, weight=1)
 
-        caption_widget = tk.Text(box, height=5, wrap="word")
-        scr = ttk.Scrollbar(box, orient=tk.VERTICAL, command=caption_widget.yview)
-        caption_widget.configure(yscrollcommand=scr.set)
-        caption_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scr.pack(side=tk.RIGHT, fill=tk.Y)
+        self._set_text(cap, caption)
 
-        self._set_text(caption_widget, caption)
+        w = _FigureWidgets(frame=frame, number_var=num_var, number_entry=num_entry, caption=cap)
+        self._figure_widgets.insert(list_index, w)
 
-        w = _FigureWidgets(frame=frame, number_var=num_var, number_entry=num_entry, caption=caption_widget)
-        for child in header.winfo_children():
-            if isinstance(child, ttk.Button) and child.cget("text") == "Delete":
-                child.configure(command=lambda w=w: self._delete_figure(w))
-                break
+        ttk.Button(
+            right,
+            text="Add above",
+            command=lambda w=w: self._add_figure(
+                insert_index=self._figure_widgets.index(w),
+                focus_number=True,
+            ),
+        ).pack(fill=tk.X, pady=(0, 6))
 
-        self._figure_widgets.append(w)
+        ttk.Button(
+            right,
+            text="Delete",
+            command=lambda w=w: self._delete_figure(w),
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(
+            right,
+            text="Add below",
+            command=lambda w=w: self._add_figure(
+                insert_index=self._figure_widgets.index(w) + 1,
+                focus_number=True,
+            ),
+        ).pack(fill=tk.X)
 
         self.figures_canvas.update_idletasks()
         self.figures_canvas.configure(scrollregion=self.figures_canvas.bbox("all"))
 
-    def _delete_figure(self, w: _FigureWidgets) -> None:
+        if focus_number:
+            try:
+                num_entry.focus_set()
+            except Exception:
+                pass
+
+    def _delete_figure(self, w: _FigureWidgets, keep_one: bool = True) -> None:
         if w in self._figure_widgets:
             self._figure_widgets.remove(w)
         w.frame.destroy()
@@ -368,6 +495,88 @@ class ExtractedTextDialog(tk.Toplevel):
             return
         open_file(self.pdf_path)
 
+    def _on_extract_text_again(self) -> None:
+        messagebox.showinfo("Not implemented", "Re-extraction for the current PDF is not implemented yet.")
+
+    def _copy_json_from_disk(self) -> None:
+        if not self.json_path.exists():
+            messagebox.showerror("Copy JSON", f"JSON not found:\n{self.json_path}")
+            return
+        try:
+            obj = json.loads(self.json_path.read_text(encoding="utf-8"))
+            txt = json.dumps(obj, ensure_ascii=False, indent=2)
+        except Exception as e:
+            messagebox.showerror("Copy JSON", f"{type(e).__name__}: {e}")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(txt)
+        messagebox.showinfo("Copy JSON", "Saved JSON has been copied to clipboard.")
+
+    def _copy_text_from_disk(self) -> None:
+        if not self.json_path.exists():
+            messagebox.showerror("Copy text", f"JSON not found:\n{self.json_path}")
+            return
+        try:
+            obj = json.loads(self.json_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            messagebox.showerror("Copy text", f"{type(e).__name__}: {e}")
+            return
+
+        parts: list[str] = []
+        title = str(obj.get("title", "") or "")
+        year = obj.get("year", "")
+        year_s = "" if year is None else str(year)
+        if title:
+            parts.append(f"Title: {title}")
+        if year_s:
+            parts.append(f"Year: {year_s}")
+
+        def add_block(label: str, text: str) -> None:
+            t = (text or "").strip()
+            if t:
+                parts.append(f"\n{label}\n{t}")
+
+        add_block("Introduction", str(obj.get("introduction", "") or ""))
+        add_block("Methods", str(obj.get("methods", "") or ""))
+        add_block("Discussion", str(obj.get("discussion", "") or ""))
+
+        results = obj.get("results") or []
+        if isinstance(results, list) and results:
+            parts.append("\nResults")
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                sub = str(item.get("section_title", "") or "").strip()
+                txt = str(item.get("section_text", "") or "").strip()
+                if sub or txt:
+                    if sub:
+                        parts.append(f"\n{sub}\n{txt}".rstrip())
+                    else:
+                        parts.append(f"\n{txt}".rstrip())
+
+        figures = obj.get("figures") or []
+        if isinstance(figures, list) and figures:
+            parts.append("\nFigures")
+            for item in figures:
+                if not isinstance(item, dict):
+                    continue
+                num = item.get("figure_number", "")
+                cap = str(item.get("caption", "") or "").strip()
+                if num is None:
+                    num = ""
+                num_s = str(num).strip()
+                if num_s or cap:
+                    header = f"Figure {num_s}".strip()
+                    if header:
+                        parts.append(f"\n{header}\n{cap}".rstrip())
+                    else:
+                        parts.append(f"\n{cap}".rstrip())
+
+        text_out = "\n".join(parts).strip() + "\n"
+        self.clipboard_clear()
+        self.clipboard_append(text_out)
+        messagebox.showinfo("Copy text", "Saved text has been copied to clipboard.")
+
     def _on_cancel(self) -> None:
         try:
             self.grab_release()
@@ -376,10 +585,21 @@ class ExtractedTextDialog(tk.Toplevel):
         self.destroy()
 
     def _on_save(self) -> None:
+        self._save_json(close_after=False)
+
+    def _on_save_and_close(self) -> None:
+        self._save_json(close_after=True)
+
+    def _save_json(self, close_after: bool) -> bool:
+        """Validate, write JSON to disk. Returns True if saved."""
         try:
             new_data = deepcopy(self.original_data)
 
-            new_data["title"] = self.title_var.get()
+            # ---- Required top-level fields ----
+            title = self.title_var.get().strip()
+            if not title:
+                raise ValueError("Title must not be empty.")
+            new_data["title"] = title
 
             year_raw = self.year_var.get().strip()
             if "year" in self.original_data and isinstance(self.original_data.get("year"), int):
@@ -389,37 +609,108 @@ class ExtractedTextDialog(tk.Toplevel):
             else:
                 new_data["year"] = year_raw
 
-            new_data["introduction"] = self._get_text(self.intro_text)
-            new_data["methods"] = self._get_text(self.methods_text)
+            introduction = self._get_text(self.intro_text).strip()
+            if not introduction:
+                raise ValueError("Introduction must not be empty.")
+            new_data["introduction"] = introduction
 
+            methods = self._get_text(self.methods_text).strip()
+            if not methods:
+                raise ValueError("Methods must not be empty.")
+            new_data["methods"] = methods
+
+            discussion = self._get_text(self.discussion_text).strip()
+            if not discussion:
+                raise ValueError("Discussion must not be empty.")
+            new_data["discussion"] = discussion
+
+            # ---- Results: validate sections ----
+            empty_text_sections: list[str] = []
+            missing_title_sections: list[str] = []
             results: list[dict] = []
-            for w in self._result_widgets:
-                results.append(
-                    {
-                        "section_title": w.title_var.get(),
-                        "section_text": self._get_text(w.text),
-                    }
-                )
-            new_data["results"] = results
 
+            for i, w in enumerate(self._result_widgets, start=1):
+                subtitle = w.title_var.get().strip()
+                body = self._get_text(w.text).strip()
+
+                if body and not subtitle:
+                    missing_title_sections.append(f"Results section #{i}")
+                    continue
+
+                if subtitle and not body:
+                    empty_text_sections.append(subtitle)
+                    continue
+
+                if not subtitle and not body:
+                    continue
+
+                results.append({"section_title": subtitle, "section_text": body})
+
+            if missing_title_sections:
+                raise ValueError(
+                    "Section titles cannot be empty. Please fill the titles for:\n"
+                    + "\n".join(f"- {x}" for x in missing_title_sections)
+                )
+
+
+            # ---- Figures: validate items ----
+            empty_caption_figs: list[str] = []
+            missing_number_figs: list[str] = []
             figures: list[dict] = []
-            for w in self._figure_widgets:
+
+            for i, w in enumerate(self._figure_widgets, start=1):
                 num_raw = w.number_var.get().strip()
-                if num_raw == "":
-                    raise ValueError("Figure number must not be empty.")
+                caption = self._get_text(w.caption).strip()
+
+                if caption and not num_raw:
+                    missing_number_figs.append(f"Figure #{i}")
+                    continue
+
+                if num_raw and not caption:
+                    empty_caption_figs.append(f"Figure {num_raw}")
+                    continue
+
+                if not num_raw and not caption:
+                    continue
+
                 try:
                     num_int = int(num_raw)
                 except Exception:
                     raise ValueError(f"Figure number must be int (got: {num_raw!r}).")
-                figures.append(
-                    {
-                        "figure_number": num_int,
-                        "caption": self._get_text(w.caption),
-                    }
+
+                figures.append({"figure_number": num_int, "caption": caption})
+
+            if missing_number_figs:
+                raise ValueError(
+                    "Figure numbers cannot be empty. Please fill the numbers for:\n"
+                    + "\n".join(f"- {x}" for x in missing_number_figs)
                 )
+
+
+            # ---- Warning: drop sections without text/caption ----
+            warn_lines: list[str] = []
+            if empty_text_sections:
+                warn_lines.append("Results sections without text will not be saved:")
+                warn_lines.extend([f"- {s}" for s in empty_text_sections])
+            if empty_caption_figs:
+                warn_lines.append("Figures without caption will not be saved:")
+                warn_lines.extend([f"- {s}" for s in empty_caption_figs])
+
+            if warn_lines:
+                warn_lines.append("")
+                warn_lines.append("Do you want to continue and save the changes?")
+                ok = messagebox.askyesno("Warning", "\n".join(warn_lines))
+                if not ok:
+                    return False
+
+            new_data["results"] = results
             new_data["figures"] = figures
 
             self.json_path.write_text(json.dumps(new_data, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._on_cancel()
+
+            if close_after:
+                self._on_cancel()
+            return True
         except Exception as e:
             messagebox.showerror("Save error", f"{type(e).__name__}: {e}")
+            return False
