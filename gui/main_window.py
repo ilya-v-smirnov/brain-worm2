@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
 
+
 from gui.db_gateway import DbGateway, FileRow
 from gui.extracted_text_dialog import ExtractedTextDialog
 from gui.file_ops import open_file
@@ -71,7 +72,10 @@ class MainWindow:
 
         # Context menu (ПКМ)
         self._ctx = tk.Menu(self.master, tearoff=False)
+        # NOTE: актуальный обработчик называется _on_view_extracted_text
         self._ctx.add_command(label="View extracted text", command=self._on_view_extracted_text)
+        self._ctx.add_separator()
+        self._ctx.add_command(label="Delete…", command=self._ctx_delete_article)
         self.tree.bind("<Button-3>", self._on_right_click)
 
     # ---------------- Startup pipeline ----------------
@@ -220,7 +224,13 @@ class MainWindow:
 
         json_path = self.db.resolve_path(json_rel)
         pdf_path = self.db.resolve_path(payload["pdf_path"])
-        ExtractedTextDialog(self.master, json_path=json_path, pdf_path=pdf_path)
+        ExtractedTextDialog(
+            self.master,
+            json_path=json_path,
+            pdf_path=pdf_path,
+            parse_pdf_func=lambda p: self.db.parse_pdf_for_article(str(p)),
+        )
+
 
     # ---------------- Utils ----------------
 
@@ -230,3 +240,84 @@ class MainWindow:
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
         self.master.update_idletasks()
+
+    def _ctx_delete_article(self):
+        iid = self.tree.focus()
+        payload = self._iid_to_payload.get(iid)
+        if not payload or payload.get("type") != "pdf":
+            return
+
+        article_id = int(payload["article_id"])
+        pdf_path = payload["pdf_path"]
+
+        db = self.db
+
+        pdf_paths = db.list_article_pdf_paths(article_id)
+        _paths = db.get_article_paths(article_id)  # можно использовать позже для расширенного UI
+
+        has_multiple = len(pdf_paths) > 1
+
+        # --- выбор режима удаления ---
+        if has_multiple:
+            choice = messagebox.askquestion(
+                "Delete article",
+                "У этой статьи есть несколько копий PDF.\n\n"
+                "YES — удалить ТОЛЬКО этот PDF-путь\n"
+                "NO — удалить ВСЕ копии и связанный ИИ-контент",
+                icon="warning",
+            )
+            delete_everywhere = (choice == "no")
+        else:
+            delete_everywhere = True
+
+        # --- подтверждение ---
+        if delete_everywhere:
+            confirm = messagebox.askyesno(
+                "Confirm deletion",
+                "Это действие удалит:\n"
+                "- все PDF-файлы статьи\n"
+                "- запись статьи из БД\n"
+                "- связанный ИИ-контент (JSON, summary, lecture)\n\n"
+                "Действие необратимо. Продолжить?",
+                icon="warning",
+            )
+            if not confirm:
+                return
+
+            report = db.delete_article_everywhere(
+                article_id=article_id,
+                delete_physical_pdfs=True,
+                delete_ai_files=True,
+            )
+        else:
+            confirm = messagebox.askyesno(
+                "Confirm deletion",
+                f"Удалить только этот PDF?\n\n{pdf_path}\n\n"
+                "Запись статьи и ИИ-контент будут сохранены.",
+                icon="warning",
+            )
+            if not confirm:
+                return
+
+            report = db.delete_single_pdf_path(
+                article_id=article_id,
+                pdf_path=pdf_path,
+                delete_physical_pdf=True,
+            )
+
+        # --- обновление GUI ---
+        self._reload_tree()
+
+        # --- краткий отчёт ---
+        msg = (
+            f"Удаление завершено.\n\n"
+            f"Удалено файлов: {len(report.deleted_files)}\n"
+            f"Отсутствовало файлов: {len(report.missing_files)}"
+        )
+        if report.updated_master_path_to:
+            msg += f"\nНовый master PDF:\n{report.updated_master_path_to}"
+        if report.errors:
+            msg += "\n\nОшибки:\n" + "\n".join(report.errors)
+
+        messagebox.showinfo("Delete result", msg)
+

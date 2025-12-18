@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox
 from tkinter import ttk
+from typing import Any, Callable
 
 from gui.file_ops import open_file
 
@@ -37,7 +38,14 @@ class ExtractedTextDialog(tk.Toplevel):
     - Figures (общая прокрутка)
     """
 
-    def __init__(self, master: tk.Misc, *, json_path: Path, pdf_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        json_path: Path,
+        pdf_path: Path | None = None,
+        parse_pdf_func: Callable[[Path], dict[str, Any]] | None = None,
+    ) -> None:
         super().__init__(master)
         self.title("Extracted Text")
         self.geometry("980x720")
@@ -47,6 +55,7 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self.json_path = json_path
         self.pdf_path = pdf_path
+        self.parse_pdf_func = parse_pdf_func
 
         self.original_data: dict = {}
         self._result_widgets: list[_ResultSectionWidgets] = []
@@ -246,9 +255,9 @@ class ExtractedTextDialog(tk.Toplevel):
         self.bind_all("<Button-4>", _on_wheel)
         self.bind_all("<Button-5>", _on_wheel)
         self.bind_all("<MouseWheel>", _on_wheel)
+
     def _build_results_inner(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Result sections:", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
-
         self.results_frame = ttk.Frame(parent)
         self.results_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
@@ -317,6 +326,48 @@ class ExtractedTextDialog(tk.Toplevel):
         # ensure scrollregion updated
         self.results_canvas.update_idletasks()
         self.figures_canvas.update_idletasks()
+
+    def _populate_from_data(self, data: dict[str, Any]) -> None:
+        """Заполняет UI данными (без записи на диск)."""
+        self.original_data = data  # важно: Save будет строить new_data от этого
+
+        self.title_var.set(str(data.get("title", "") or ""))
+        self.year_var.set(str(data.get("year", "") or ""))
+
+        self._set_text(self.intro_text, str(data.get("introduction", "") or ""))
+        self._set_text(self.methods_text, str(data.get("methods", "") or ""))
+        self._set_text(self.discussion_text, str(data.get("discussion", "") or ""))
+
+        # Results
+        self._clear_results()
+        results = data.get("results") or []
+        if isinstance(results, list):
+            for item in results:
+                if isinstance(item, dict):
+                    self._add_result_section(
+                        section_title=str(item.get("section_title", "") or ""),
+                        section_text=str(item.get("section_text", "") or ""),
+                    )
+        if not self._result_widgets:
+            self._add_result_section()
+
+        # Figures
+        self._clear_figures()
+        figures = data.get("figures") or []
+        if isinstance(figures, list):
+            for item in figures:
+                if isinstance(item, dict):
+                    num = item.get("figure_number", "")
+                    self._add_figure(
+                        figure_number=str(num if num is not None else ""),
+                        caption=str(item.get("caption", "") or ""),
+                    )
+        if not self._figure_widgets:
+            self._add_figure()
+
+        self.results_canvas.update_idletasks()
+        self.figures_canvas.update_idletasks()
+
 
     def _clear_results(self) -> None:
         for w in list(self._result_widgets):
@@ -638,7 +689,37 @@ class ExtractedTextDialog(tk.Toplevel):
         open_file(self.pdf_path)
 
     def _on_extract_text_again(self) -> None:
-        messagebox.showinfo("Not implemented", "Re-extraction for the current PDF is not implemented yet.")
+        # Правило: никаких записей на диск. Только обновление UI.
+        if not self.pdf_path:
+            messagebox.showinfo("Extract text again", "PDF path is not available.")
+            return
+
+        if not self.pdf_path.exists():
+            messagebox.showerror("Extract text again", f"PDF not found:\n{self.pdf_path}")
+            return
+
+        if not self.parse_pdf_func:
+            messagebox.showerror(
+                "Extract text again",
+                "Parsing function is not available (parse_pdf_func is None).",
+            )
+            return
+
+        ok = messagebox.askyesno(
+            "Extract text again",
+            "Re-extract content from the PDF?",
+            icon="warning"
+        )
+        if not ok:
+            return
+        try:
+            data = self.parse_pdf_func(self.pdf_path)
+            if not isinstance(data, dict):
+                raise TypeError("parse_pdf_func must return dict")
+            self._populate_from_data(data)
+        except Exception as e:
+            messagebox.showerror("Extract text again", f"{type(e).__name__}: {e}")
+
 
     def _copy_json_from_disk(self) -> None:
         if not self.json_path.exists():

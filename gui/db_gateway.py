@@ -8,8 +8,13 @@ from dbmanager.db_core import get_project_home_dir, init_db_schema as _init_db_s
 from dbmanager.db_maintenance import (
     sync_article_database as _sync_article_database,
     extract_contents_for_new_articles as _extract_contents_for_new_articles,
+    list_article_pdf_paths as _list_article_pdf_paths,
+    get_article_paths as _get_article_paths,
+    delete_single_pdf_path as _delete_single_pdf_path,
+    delete_article_everywhere as _delete_article_everywhere,
+    parse_pdf_for_article as _parse_pdf_for_article,
+    DeleteReport,
 )
-
 
 @dataclass(frozen=True)
 class FileRow:
@@ -89,7 +94,49 @@ class DbGateway:
         finally:
             conn.close()
 
+    # ---- Delete / re-extract helpers for GUI ----
+
+    def list_article_pdf_paths(self, article_id: int) -> list[str]:
+        return _list_article_pdf_paths(article_id)
+
+    def get_article_paths(self, article_id: int) -> dict[str, str | None]:
+        return _get_article_paths(article_id)
+
+    def delete_single_pdf_path(
+        self,
+        *,
+        article_id: int,
+        pdf_path: str,
+        delete_physical_pdf: bool,
+    ) -> DeleteReport:
+        return _delete_single_pdf_path(
+            article_id=article_id,
+            pdf_path=pdf_path,
+            delete_physical_pdf=delete_physical_pdf,
+        )
+
+    def delete_article_everywhere(
+        self,
+        *,
+        article_id: int,
+        delete_physical_pdfs: bool,
+        delete_ai_files: bool,
+    ) -> DeleteReport:
+        return _delete_article_everywhere(
+            article_id=article_id,
+            delete_physical_pdfs=delete_physical_pdfs,
+            delete_ai_files=delete_ai_files,
+        )
+
+    def parse_pdf_for_article(self, pdf_rel_or_abs: str) -> dict:
+        pdf_abs = self.resolve_path(pdf_rel_or_abs)
+        return _parse_pdf_for_article(pdf_abs)
+
     def resolve_path(self, rel_or_abs: str) -> Path:
+        """
+        Преобразует относительный путь (относительно корня проекта) в абсолютный.
+        Если путь уже абсолютный — возвращает его как есть.
+        """
         p = Path(rel_or_abs)
         return p if p.is_absolute() else (self.project_home / p)
 

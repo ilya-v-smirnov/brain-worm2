@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
+from dataclasses import dataclass, field
 
 from dbmanager.db_core import get_project_home_dir, get_connection
 from pdfparser.pdf_extract_content import parse_pdf_content
@@ -233,6 +234,8 @@ def _save_json_file(data: Dict[str, Any], out_path: Path) -> None:
 def extract_contents_for_new_articles(
     article_ids: Optional[List[int]] = None,
     limit: Optional[int] = None,
+    *,
+    force: bool = False,
 ) -> List[int]:
     """
     Этап 3: экстракция содержимого новых статей.
@@ -260,8 +263,15 @@ def extract_contents_for_new_articles(
     processed_ids: List[int] = []
 
     # Строим запрос к Article
-    where_clauses = ["(json_path IS NULL OR json_path = '')"]
     params: List[Any] = []
+    where_clauses: List[str] = []
+
+    # По умолчанию берём только статьи без json_path.
+    # При force=True это ограничение снимается ТОЛЬКО если явно переданы article_ids,
+    # чтобы случайно не перезаписать JSON для всей базы.
+    if (not force) or (force and not article_ids):
+        where_clauses.append("(json_path IS NULL OR json_path = '')")
+
 
     if article_ids:
         # Если список пуст, просто ничего не делаем
@@ -326,3 +336,174 @@ def extract_contents_for_new_articles(
         conn.commit()
 
     return processed_ids
+
+
+# ---------- Удаление статей/файлов (для GUI) ----------
+
+@dataclass
+class DeleteReport:
+    article_id: int
+    mode: str  # "single_path" | "article_everywhere"
+    removed_article_row: bool = False
+    removed_articlefile_rows: int = 0
+    updated_master_path_to: str | None = None
+    deleted_files: list[str] = field(default_factory=list)
+    missing_files: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+def list_article_pdf_paths(article_id: int) -> List[str]:
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT pdf_path FROM ArticleFile WHERE article_id = ? ORDER BY id;",
+            (article_id,),
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
+def get_article_paths(article_id: int) -> Dict[str, Optional[str]]:
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT pdf_master_path, json_path, summary_path, lecture_text_path, lecture_audio_path
+            FROM Article
+            WHERE id = ?;
+            """,
+            (article_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return {
+            "pdf_master_path": row[0],
+            "json_path": row[1],
+            "summary_path": row[2],
+            "lecture_text_path": row[3],
+            "lecture_audio_path": row[4],
+        }
+
+
+def _safe_unlink(path: Path, report: DeleteReport) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+            report.deleted_files.append(str(path))
+        else:
+            report.missing_files.append(str(path))
+    except Exception as e:
+        report.errors.append(f"unlink_error: {path}: {type(e).__name__}: {e}")
+
+
+def delete_single_pdf_path(
+    *,
+    article_id: int,
+    pdf_path: str,
+    delete_physical_pdf: bool,
+) -> DeleteReport:
+    report = DeleteReport(article_id=article_id, mode="single_path")
+    project_home = get_project_home_dir()
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+
+        cur.execute("SELECT pdf_master_path FROM Article WHERE id = ?;", (article_id,))
+        row = cur.fetchone()
+        if not row:
+            report.errors.append("article_not_found")
+            return report
+        master_path = row[0]
+
+        cur.execute(
+            "DELETE FROM ArticleFile WHERE article_id = ? AND pdf_path = ?;",
+            (article_id, pdf_path),
+        )
+        report.removed_articlefile_rows = cur.rowcount
+
+        # Если удалили master — переназначаем на оставшийся
+        if master_path == pdf_path:
+            cur.execute(
+                "SELECT pdf_path FROM ArticleFile WHERE article_id = ? ORDER BY id LIMIT 1;",
+                (article_id,),
+            )
+            r2 = cur.fetchone()
+            if r2:
+                new_master = r2[0]
+                cur.execute(
+                    "UPDATE Article SET pdf_master_path = ? WHERE id = ?;",
+                    (new_master, article_id),
+                )
+                report.updated_master_path_to = new_master
+
+        conn.commit()
+
+    if delete_physical_pdf:
+        p = Path(pdf_path)
+        abs_path = p if p.is_absolute() else (project_home / p)
+        _safe_unlink(abs_path, report)
+
+    return report
+
+
+def delete_article_everywhere(
+    *,
+    article_id: int,
+    delete_physical_pdfs: bool,
+    delete_ai_files: bool,
+) -> DeleteReport:
+    report = DeleteReport(article_id=article_id, mode="article_everywhere")
+    project_home = get_project_home_dir()
+
+    pdf_paths = list_article_pdf_paths(article_id)
+    paths = get_article_paths(article_id)
+    if not paths:
+        report.errors.append("article_not_found")
+        return report
+
+    ai_candidates: list[str] = []
+    if delete_ai_files:
+        for k in ("json_path", "summary_path", "lecture_text_path", "lecture_audio_path"):
+            v = paths.get(k)
+            if v:
+                ai_candidates.append(v)
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM Article WHERE id = ?;", (article_id,))
+        report.removed_article_row = (cur.rowcount > 0)
+        conn.commit()
+
+    if delete_physical_pdfs:
+        for pdf_path in pdf_paths:
+            p = Path(pdf_path)
+            abs_path = p if p.is_absolute() else (project_home / p)
+            _safe_unlink(abs_path, report)
+
+    if delete_ai_files:
+        for rel_or_abs in ai_candidates:
+            p = Path(rel_or_abs)
+            abs_path = p if p.is_absolute() else (project_home / p)
+            _safe_unlink(abs_path, report)
+
+    return report
+
+# ---------- Повторный парсинг (без сохранения) ----------
+
+def parse_pdf_for_article(pdf_abs_path: Path) -> Dict[str, Any]:
+    """Парсит PDF и возвращает структуру как для JSON, но НЕ сохраняет на диск."""
+    try:
+        parsed = parse_pdf_content(pdf_abs_path)
+        parsed.setdefault("parsing_error", None)
+        return parsed
+    except Exception as e:
+        return {
+            "title": "",
+            "year": "",
+            "introduction": "",
+            "methods": "",
+            "results": [],
+            "discussion": "",
+            "figures": [],
+            "parsing_error": f"parse_pdf_content_error: {type(e).__name__}: {e}",
+        }
