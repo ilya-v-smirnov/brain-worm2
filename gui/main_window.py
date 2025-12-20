@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import subprocess
+from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
@@ -9,6 +12,9 @@ from gui.db_gateway import DbGateway, FileRow
 from gui.extracted_text_dialog import ExtractedTextDialog
 from gui.file_ops import open_file
 from gui.rename_new_pdfs_dialog import RenameNewPdfsDialog
+from gui.summary_generation_dialog import SummaryGenerationDialog
+from docx_utils.docx_writer import write_article_json_to_docx
+
 
 CHECK = "✓"
 DASH = "-"
@@ -28,6 +34,7 @@ class MainWindow:
 
         root = ttk.Frame(self.master, padding=10)
         root.pack(fill=tk.BOTH, expand=True)
+        self.root = root
 
         top = ttk.Frame(root)
         top.pack(fill=tk.X)
@@ -58,12 +65,29 @@ class MainWindow:
         yscroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         bottom = ttk.Frame(root)
-        bottom.pack(fill=tk.X)
+        bottom.pack(fill=tk.X, padx=10, pady=8)
 
-        ttk.Frame(bottom).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(bottom, text="Generate Summary", command=lambda: self._on_generate("summary")).pack(side=tk.RIGHT)
-        ttk.Button(bottom, text="Generate Lecture", command=lambda: self._on_generate("lecture")).pack(side=tk.RIGHT, padx=(10, 0))
-        ttk.Button(bottom, text="Generate Audio", command=lambda: self._on_generate("audio")).pack(side=tk.RIGHT, padx=(10, 0))
+        for col in range(3):
+            bottom.columnconfigure(col, weight=1, uniform="bottom_buttons")
+
+        ttk.Button(
+            bottom,
+            text="1. Generate Summary",
+            command=lambda: self._on_generate("summary"),
+        ).grid(row=0, column=0, sticky="ew", padx=6)
+
+        ttk.Button(
+            bottom,
+            text="2. Generate Lecture",
+            command=lambda: self._on_generate("lecture"),
+        ).grid(row=0, column=1, sticky="ew", padx=6)
+
+        ttk.Button(
+            bottom,
+            text="3. Generate Audio",
+            command=lambda: self._on_generate("audio"),
+        ).grid(row=0, column=2, sticky="ew", padx=6)
+
 
         self.status_var = tk.StringVar(value="Starting…")
         ttk.Label(root, textvariable=self.status_var, anchor="w").pack(fill=tk.X, pady=(8, 0))
@@ -165,7 +189,56 @@ class MainWindow:
         if not payload or payload.get("type") != "pdf":
             messagebox.showwarning("Generate", "Select an article PDF first.")
             return
-        messagebox.showinfo("Generate", "Not implemented yet")
+
+        if kind != "summary":
+            messagebox.showinfo("Generate", "Not implemented yet")
+            return
+
+        # 1) options dialog (modal)
+        dlg = SummaryGenerationDialog(self.master, default_model="ChatGPT-5.2", default_language="EN")
+        opts = dlg.show()
+        if opts is None:
+            return
+
+        # 2) resolve JSON path for selected article
+        article_id = int(payload["article_id"])
+
+        try:
+            json_rel = self.db.fetch_json_path_for_article(article_id)
+        except Exception as e:
+            messagebox.showerror("Generate Summary", f"{type(e).__name__}: {e}")
+            return
+
+        if not json_rel:
+            messagebox.showwarning("Generate Summary", "No extracted JSON for this article yet.")
+            return
+
+        json_path = Path(self.db.resolve_path(json_rel))
+
+        # 3) resolve PDF abs path (for mirrored output)
+        pdf_abs = Path(self.db.resolve_path(payload["pdf_path"]))
+
+        # 4) load JSON
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            messagebox.showerror("Generate Summary", f"Failed to read JSON:\n{type(e).__name__}: {e}")
+            return
+
+        # 5) export DOCX
+        out_docx = self._build_summary_docx_path(pdf_abs)
+
+        try:
+            write_article_json_to_docx(
+                data,
+                out_docx,
+                title=pdf_abs.stem,
+            )
+        except Exception as e:
+            messagebox.showerror("Generate Summary", f"Failed to write DOCX:\n{type(e).__name__}: {e}")
+            return
+
+        self._open_with_system_app(out_docx)
 
     def _on_double_click(self, event: tk.Event) -> None:
         iid = self.tree.focus()
@@ -230,6 +303,37 @@ class MainWindow:
             pdf_path=pdf_path,
             parse_pdf_func=lambda p: self.db.parse_pdf_for_article(str(p)),
         )
+
+    def _build_summary_docx_path(self, pdf_abs_path: Path) -> Path:
+        """
+        Mirror:
+          Article Database/.../file.pdf -> PDF_summaries/.../file.docx
+
+        If "Article Database" is not found in the path, fallback to ./PDF_summaries/<name>.docx
+        """
+        pdf_abs_path = Path(pdf_abs_path)
+
+        parts = list(pdf_abs_path.parts)
+        if "Article Database" in parts:
+            idx = parts.index("Article Database")
+            articles_root = Path(*parts[: idx + 1])          # .../Article Database
+            rel = pdf_abs_path.relative_to(articles_root)    # folder1/folder2/file.pdf
+            return articles_root.parent / "PDF_summaries" / rel.with_suffix(".docx")
+
+        # fallback
+        return Path("PDF_summaries") / pdf_abs_path.with_suffix(".docx").name
+
+    def _open_with_system_app(self, path: Path) -> None:
+        """
+        Open file using system default application (Ubuntu: xdg-open).
+        Non-blocking.
+        """
+        try:
+            subprocess.Popen(["xdg-open", str(path)])
+        except FileNotFoundError:
+            messagebox.showerror("Open file", "xdg-open not found. Install 'xdg-utils' package.")
+        except Exception as e:
+            messagebox.showerror("Open file", f"Failed to open file:\n{type(e).__name__}: {e}")
 
 
     # ---------------- Utils ----------------

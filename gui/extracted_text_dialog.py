@@ -29,7 +29,7 @@ class _FigureWidgets:
 
 
 class ExtractedTextDialog(tk.Toplevel):
-    """Модальный редактор JSON по ТЗ (с вкладками и прокруткой).
+    """Модальный редактор JSON.
 
     Вкладки:
     - Introduction
@@ -50,8 +50,16 @@ class ExtractedTextDialog(tk.Toplevel):
         self.title("Extracted Text")
         self.geometry("980x720")
 
-        self.transient(master)
+        # self.transient(master)
         self.grab_set()
+
+        # Optional: hint WM that this is a normal window (helps on some WMs)
+        try:
+            self.wm_attributes("-type", "normal")
+        except tk.TclError:
+            pass
+
+        self.lift()
 
         self.json_path = json_path
         self.pdf_path = pdf_path
@@ -265,7 +273,11 @@ class ExtractedTextDialog(tk.Toplevel):
         header = ttk.Frame(parent)
         header.pack(fill=tk.X)
         ttk.Label(header, text="Figures:", font=("TkDefaultFont", 10, "bold")).pack(side=tk.LEFT, anchor="w")
-        ttk.Button(header, text="Order", command=self._order_figures_by_number).pack(side=tk.RIGHT)
+        ttk.Button(
+            header,
+            text="Order",
+            command=self._order_figures_by_number,
+        ).pack(side=tk.RIGHT, padx=(0, 12))
 
         self.figures_frame = ttk.Frame(parent)
         self.figures_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -838,8 +850,8 @@ class ExtractedTextDialog(tk.Toplevel):
             new_data["introduction"] = introduction
 
             methods = self._get_text(self.methods_text).strip()
-            if not methods:
-                raise ValueError("Methods must not be empty.")
+            # if not methods:
+            #     raise ValueError("Methods must not be empty.")
             new_data["methods"] = methods
 
             discussion = self._get_text(self.discussion_text).strip()
@@ -875,7 +887,6 @@ class ExtractedTextDialog(tk.Toplevel):
                     + "\n".join(f"- {x}" for x in missing_title_sections)
                 )
 
-
             # ---- Figures: validate items ----
             empty_caption_figs: list[str] = []
             missing_number_figs: list[str] = []
@@ -908,7 +919,6 @@ class ExtractedTextDialog(tk.Toplevel):
                     "Figure numbers cannot be empty. Please fill the numbers for:\n"
                     + "\n".join(f"- {x}" for x in missing_number_figs)
                 )
-
 
             # ---- Warning: drop sections without text/caption ----
             warn_lines: list[str] = []
