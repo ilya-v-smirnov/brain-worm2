@@ -385,6 +385,25 @@ def get_article_paths(article_id: int) -> Dict[str, Optional[str]]:
         }
 
 
+
+def set_article_summary_path(article_id: int, summary_path: Optional[str]) -> None:
+    """
+    Записывает путь к docx с AI-summary в Article.summary_path.
+
+    summary_path рекомендуется хранить относительным к PROJECT_HOME_DIR.
+    Можно передать None, чтобы очистить поле.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE Article SET summary_path = ? WHERE id = ?;",
+            (summary_path, article_id),
+        )
+        conn.commit()
+
+
+
+
 def _safe_unlink(path: Path, report: DeleteReport) -> None:
     try:
         if path.exists():

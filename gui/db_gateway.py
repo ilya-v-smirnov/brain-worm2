@@ -10,6 +10,7 @@ from dbmanager.db_maintenance import (
     extract_contents_for_new_articles as _extract_contents_for_new_articles,
     list_article_pdf_paths as _list_article_pdf_paths,
     get_article_paths as _get_article_paths,
+    set_article_summary_path as _set_article_summary_path,
     delete_single_pdf_path as _delete_single_pdf_path,
     delete_article_everywhere as _delete_article_everywhere,
     parse_pdf_for_article as _parse_pdf_for_article,
@@ -93,6 +94,25 @@ class DbGateway:
             return None if not row else row[0]
         finally:
             conn.close()
+
+
+    def set_summary_path_for_article(self, article_id: int, docx_abs_path: Path) -> str:
+        """
+        Сохраняет путь к summary docx в БД (Article.summary_path).
+
+        В БД пишется путь ОТНОСИТЕЛЬНО project_home, если файл лежит внутри него,
+        иначе пишется абсолютный путь.
+        Возвращает строку, записанную в БД.
+        """
+        docx_abs_path = Path(docx_abs_path).resolve()
+        try:
+            rel = docx_abs_path.relative_to(self.project_home)
+            rel_str = str(rel)
+        except Exception:
+            rel_str = str(docx_abs_path)
+
+        _set_article_summary_path(article_id, rel_str)
+        return rel_str
 
     # ---- Delete / re-extract helpers for GUI ----
 

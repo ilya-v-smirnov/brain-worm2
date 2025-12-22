@@ -6,6 +6,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
+import threading
 
 
 from gui.db_gateway import DbGateway, FileRow
@@ -13,7 +14,8 @@ from gui.extracted_text_dialog import ExtractedTextDialog
 from gui.file_ops import open_file
 from gui.rename_new_pdfs_dialog import RenameNewPdfsDialog
 from gui.summary_generation_dialog import SummaryGenerationDialog
-from docx_utils.docx_writer import write_article_json_to_docx
+from ai_summary.generator import generate_summary
+from docx_utils.docx_writer import append_ai_summary_to_docx
 
 
 CHECK = "✓"
@@ -70,24 +72,26 @@ class MainWindow:
         for col in range(3):
             bottom.columnconfigure(col, weight=1, uniform="bottom_buttons")
 
-        ttk.Button(
+        self.btn_generate_summary = ttk.Button(
             bottom,
             text="1. Generate Summary",
             command=lambda: self._on_generate("summary"),
-        ).grid(row=0, column=0, sticky="ew", padx=6)
+        )
+        self.btn_generate_summary.grid(row=0, column=0, sticky="ew", padx=6)
 
-        ttk.Button(
+        self.btn_generate_lecture = ttk.Button(
             bottom,
             text="2. Generate Lecture",
             command=lambda: self._on_generate("lecture"),
-        ).grid(row=0, column=1, sticky="ew", padx=6)
+        )
+        self.btn_generate_lecture.grid(row=0, column=1, sticky="ew", padx=6)
 
-        ttk.Button(
+        self.btn_generate_audio = ttk.Button(
             bottom,
             text="3. Generate Audio",
             command=lambda: self._on_generate("audio"),
-        ).grid(row=0, column=2, sticky="ew", padx=6)
-
+        )
+        self.btn_generate_audio.grid(row=0, column=2, sticky="ew", padx=6)
 
         self.status_var = tk.StringVar(value="Starting…")
         ttk.Label(root, textvariable=self.status_var, anchor="w").pack(fill=tk.X, pady=(8, 0))
@@ -194,51 +198,145 @@ class MainWindow:
             messagebox.showinfo("Generate", "Not implemented yet")
             return
 
-        # 1) options dialog (modal)
         dlg = SummaryGenerationDialog(self.master, default_model="ChatGPT-5.2", default_language="EN")
         opts = dlg.show()
         if opts is None:
             return
 
-        # 2) resolve JSON path for selected article
         article_id = int(payload["article_id"])
-
-        try:
-            json_rel = self.db.fetch_json_path_for_article(article_id)
-        except Exception as e:
-            messagebox.showerror("Generate Summary", f"{type(e).__name__}: {e}")
+        pdf_path_rel = payload.get("pdf_path")  # то, что в БД (обычно относительное)
+        if not pdf_path_rel:
+            messagebox.showerror("Generate Summary", "Internal error: PDF path not found in DB payload.")
             return
 
-        if not json_rel:
-            messagebox.showwarning("Generate Summary", "No extracted JSON for this article yet.")
-            return
+        out_docx = self._build_summary_docx_path(pdf_path_rel)
+        out_docx.parent.mkdir(parents=True, exist_ok=True)
 
-        json_path = Path(self.db.resolve_path(json_rel))
+        self._set_busy(True, "Generating summary…")
 
-        # 3) resolve PDF abs path (for mirrored output)
-        pdf_abs = Path(self.db.resolve_path(payload["pdf_path"]))
+        def worker() -> None:
+            try:
+                # 1) read parsed JSON
+                paths = self.db.get_article_paths(article_id)
+                json_rel = paths.get("json_path")
+                if not json_rel:
+                    raise KeyError("json_path is missing for this article in DB (Article.json_path).")
 
-        # 4) load JSON
-        try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            messagebox.showerror("Generate Summary", f"Failed to read JSON:\n{type(e).__name__}: {e}")
-            return
+                json_abs = self.db.resolve_path(json_rel)
+                data = json.loads(Path(json_abs).read_text(encoding="utf-8"))
 
-        # 5) export DOCX
-        out_docx = self._build_summary_docx_path(pdf_abs)
+                # 2) generate summary (strategy auto)
+                summary, _usage = generate_summary(
+                    data,
+                    model=opts.model,
+                    language=opts.language,
+                    strategy="auto",
+                )
 
-        try:
-            write_article_json_to_docx(
-                data,
-                out_docx,
-                title=pdf_abs.stem,
-            )
-        except Exception as e:
-            messagebox.showerror("Generate Summary", f"Failed to write DOCX:\n{type(e).__name__}: {e}")
-            return
+                # --- ensure header exists for docx_writer ---
+                hdr = summary.get("header") if isinstance(summary, dict) else None
+                if not isinstance(hdr, dict):
+                    hdr = {}
 
+                hdr.setdefault("title", data.get("title", ""))
+                hdr.setdefault("year", data.get("year", ""))
+                hdr.setdefault("source_path", pdf_path_rel)   # путь PDF из БД (как хранится)
+                hdr.setdefault("model", opts.model)
+                hdr.setdefault("language", opts.language)
+
+                summary["header"] = hdr
+
+                # --- normalize results shape for docx_writer ---
+                src_results = data.get("results") or []
+                expected_titles = [
+                    (r.get("section_title") or r.get("title") or "").strip()
+                    for r in src_results
+                    if (r.get("section_title") or r.get("title"))
+                ]
+
+                norm_results = []
+                raw_results = summary.get("results") if isinstance(summary, dict) else None
+                if not isinstance(raw_results, list):
+                    raw_results = []
+
+                for item in raw_results:
+                    if not isinstance(item, dict):
+                        continue
+                    title = (item.get("section_title") or item.get("title") or item.get("section") or "").strip()
+                    mini = (item.get("mini_summary") or item.get("text") or item.get("summary") or item.get("content") or "").strip()
+                    if title and mini:
+                        norm_results.append({"section_title": title, "mini_summary": mini})
+
+                # If model returned something weird or titles mismatched, enforce 1:1 using expected_titles
+                if expected_titles:
+                    by_title = {r["section_title"]: r["mini_summary"] for r in norm_results}
+                    norm_results = [{"section_title": t, "mini_summary": by_title.get(t, "—")} for t in expected_titles]
+
+                summary["results"] = norm_results
+
+                # --- normalize figures shape for docx_writer: summary["figures"]["items"] = [{"figure": "...", "summary": "..."}] ---
+                figs = summary.get("figures")
+                if not isinstance(figs, dict):
+                    figs = {}
+
+                items = figs.get("items")
+                if not isinstance(items, list):
+                    # allow if model returned a plain narrative string
+                    narrative = figs.get("narrative") or summary.get("figures_narrative") or ""
+                    narrative = narrative.strip() if isinstance(narrative, str) else ""
+                    items = []
+                    if narrative:
+                        items.append({"figure": "Figures narrative", "summary": narrative})
+                else:
+                    norm_items = []
+                    for it in items:
+                        if not isinstance(it, dict):
+                            continue
+                        figure = (it.get("figure") or it.get("id") or it.get("name") or "").strip()
+                        summ = (it.get("summary") or it.get("text") or it.get("caption_summary") or "").strip()
+                        if figure and summ:
+                            norm_items.append({"figure": figure, "summary": summ})
+                    items = norm_items
+
+                figs["items"] = items
+                summary["figures"] = figs
+
+
+                # 3) write docx (append)
+                from docx_utils.docx_writer import append_ai_summary_to_docx
+                append_ai_summary_to_docx(docx_path=out_docx, summary=summary)
+
+                # 4) update DB path (store rel if possible)
+                self.db.set_summary_path_for_article(article_id, out_docx)
+
+                # 5) back to UI thread: reload + open
+                self.master.after(0, lambda: self._on_summary_success(out_docx))
+
+            except ValueError as e:
+                self.master.after(0, lambda err=e: self._on_summary_error(err, is_user_fixable=True))
+            except Exception as e:
+                self.master.after(0, lambda err=e: self._on_summary_error(err, is_user_fixable=False))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+    def _on_summary_done(self, out_docx: Path) -> None:
+        self._reload_tree()
+        self._set_busy(False, "Ready")
         self._open_with_system_app(out_docx)
+
+    def _on_summary_error(self, e: Exception) -> None:
+        self._set_busy(False, "Ready")
+        # Friendly handling for the key expected error
+        if isinstance(e, ValueError) and "No Results subsections" in str(e):
+            messagebox.showerror(
+                "Generate Summary",
+                "Невозможно сгенерировать summary: секция Results пуста или не распознана.\n\n"
+                "Пожалуйста, заполните Results вручную (подразделы Results должны существовать), "
+                "затем попробуйте снова.",
+            )
+            return
+        messagebox.showerror("Generate Summary", f"Generation failed:\n{type(e).__name__}: {e}")
 
     def _on_double_click(self, event: tk.Event) -> None:
         iid = self.tree.focus()
@@ -304,24 +402,38 @@ class MainWindow:
             parse_pdf_func=lambda p: self.db.parse_pdf_for_article(str(p)),
         )
 
-    def _build_summary_docx_path(self, pdf_abs_path: Path) -> Path:
+    def _build_summary_docx_path(self, pdf_rel_or_abs: str) -> Path:
+        """Build summary DOCX path.
+
+        Requirement:
+        - Save under PROJECT_HOME_DIR/PDF_summaries
+        - Mirror the folder structure *inside* the Article Database.
+
+        Examples:
+          "Article Database/folder1/folder2/paper.pdf" ->
+          "PDF_summaries/folder1/folder2/paper.docx"  (relative to project home)
+
+          "folder1/folder2/paper.pdf" ->
+          "PDF_summaries/folder1/folder2/paper.docx"  (relative to project home)
         """
-        Mirror:
-          Article Database/.../file.pdf -> PDF_summaries/.../file.docx
 
-        If "Article Database" is not found in the path, fallback to ./PDF_summaries/<name>.docx
-        """
-        pdf_abs_path = Path(pdf_abs_path)
+        p = Path(pdf_rel_or_abs)
+        # If absolute, try to make it project-relative
+        if p.is_absolute():
+            try:
+                p = p.relative_to(self.db.project_home)
+            except Exception:
+                # absolute but outside the project -> just mirror its name
+                p = Path(p.name)
 
-        parts = list(pdf_abs_path.parts)
-        if "Article Database" in parts:
-            idx = parts.index("Article Database")
-            articles_root = Path(*parts[: idx + 1])          # .../Article Database
-            rel = pdf_abs_path.relative_to(articles_root)    # folder1/folder2/file.pdf
-            return articles_root.parent / "PDF_summaries" / rel.with_suffix(".docx")
+        # Strip leading "Article Database" if present
+        if p.parts and p.parts[0] == "Article Database":
+            p_inside = Path(*p.parts[1:])
+        else:
+            p_inside = p
 
-        # fallback
-        return Path("PDF_summaries") / pdf_abs_path.with_suffix(".docx").name
+        out = self.db.project_home / "PDF_summaries" / p_inside
+        return out.with_suffix(".docx")
 
     def _open_with_system_app(self, path: Path) -> None:
         """
@@ -335,6 +447,69 @@ class MainWindow:
         except Exception as e:
             messagebox.showerror("Open file", f"Failed to open file:\n{type(e).__name__}: {e}")
 
+    def _on_summary_success(self, out_docx: Path) -> None:
+        self._set_busy(False, "Ready")
+        self._reload_tree()
+        self._open_with_system_app(out_docx)
+
+    def _on_summary_error(self, e: Exception, *, is_user_fixable: bool) -> None:
+        self._set_busy(False, "Ready")
+
+        msg = f"{type(e).__name__}: {e}"
+        if is_user_fixable and "No Results subsections found" in str(e):
+            messagebox.showerror(
+                "Generate Summary",
+                "Results section is empty.\n\n"
+                "Please fill Results subsections manually (in the extracted JSON), then try again.\n\n"
+                f"Details:\n{msg}",
+            )
+            return
+
+        messagebox.showerror(
+            "Generate Summary",
+            "Summary generation failed.\n\n"
+            f"Details:\n{msg}",
+        )
+
+    def _set_busy(self, busy: bool, status_text: str) -> None:
+        self.status_var.set(status_text)
+        state = "disabled" if busy else "normal"
+        for btn in (getattr(self, "btn_generate_summary", None),
+                    getattr(self, "btn_generate_lecture", None),
+                    getattr(self, "btn_generate_audio", None)):
+            if btn is not None:
+                btn.configure(state=state)
+
+        try:
+            self.master.configure(cursor="watch" if busy else "")
+        except Exception:
+            pass
+
+    def _build_summary_docx_path(self, pdf_rel_or_abs: str) -> Path:
+        """
+        Mirrors Article Database PDF path into PROJECT_HOME_DIR/PDF_summaries.
+
+        Examples:
+          "Article Database/f1/f2/A.pdf" -> "<PROJECT_HOME>/PDF_summaries/f1/f2/A.docx"
+          "f1/f2/A.pdf"                 -> "<PROJECT_HOME>/PDF_summaries/f1/f2/A.docx"
+        """
+        project_home = self.db.project_home
+        p = Path(pdf_rel_or_abs)
+
+        # normalize to relative where possible
+        if p.is_absolute():
+            try:
+                p = p.relative_to(project_home)
+            except Exception:
+                # if absolute but not under project_home, we still mirror its tail path
+                p = Path(*p.parts[1:])  # drop root "/"
+
+        parts = list(p.parts)
+        if parts and parts[0] == "Article Database":
+            parts = parts[1:]
+
+        mirrored = Path(*parts).with_suffix(".docx")
+        return project_home / "PDF_summaries" / mirrored
 
     # ---------------- Utils ----------------
 
@@ -343,6 +518,25 @@ class MainWindow:
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
+        self.master.update_idletasks()
+
+    def _set_busy(self, busy: bool, status_text: str) -> None:
+        """Enable/disable main actions and show status."""
+        self._set_status(status_text)
+        state = "disabled" if busy else "normal"
+        # Buttons may not exist during early startup
+        for btn_name in ("btn_generate_summary", "btn_generate_lecture", "btn_generate_audio"):
+            btn = getattr(self, btn_name, None)
+            if btn is not None:
+                try:
+                    btn.configure(state=state)
+                except Exception:
+                    pass
+
+        try:
+            self.master.configure(cursor="watch" if busy else "")
+        except Exception:
+            pass
         self.master.update_idletasks()
 
     def _ctx_delete_article(self):
