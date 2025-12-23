@@ -1,22 +1,8 @@
 import json
 import re
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Mapping
 
 from ai_summary.openai_client import get_openai_client
-
-
-SUMMARY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "header": {"type": "object"},
-        "key_points": {"type": "array", "items": {"type": "string"}},
-        "introduction": {"type": "string"},
-        "results": {"type": "array"},
-        "discussion": {"type": "string"},
-        "figures": {"type": "object"},
-    },
-    "required": ["header", "key_points", "introduction", "results", "discussion", "figures"],
-}
 
 MINI_RESULT_SCHEMA = {
     "type": "object",
@@ -25,6 +11,45 @@ MINI_RESULT_SCHEMA = {
         "mini_summary": {"type": "string"},
     },
     "required": ["section_title", "mini_summary"],
+}
+
+SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "header": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "year": {},
+                "source_path": {"type": "string"},
+                "model": {"type": "string"},
+                "language": {"type": "string"},
+            },
+            "required": ["title", "year", "source_path", "model", "language"],
+        },
+        "key_points": {"type": "array", "items": {"type": "string"}},
+        "introduction": {"type": "string"},
+        "results": {"type": "array", "items": MINI_RESULT_SCHEMA},
+        "discussion": {"type": "string"},
+        "figures": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "figure": {"type": "string"},
+                            "summary": {"type": "string"},
+                        },
+                        "required": ["figure", "summary"],
+                    },
+                }
+            },
+            "required": ["items"],
+        },
+    },
+    "required": ["header", "key_points", "introduction", "results", "discussion", "figures"],
 }
 
 FIGURES_CHUNK_SCHEMA = {
@@ -80,6 +105,480 @@ def _lang_label(language: str) -> str:
         return "English"
     # fallback: pass through as-is
     return language
+
+
+def _get_results_titles_from_input(article_json: Dict[str, Any]) -> List[str]:
+    def _get_res_title(item: dict) -> str:
+        return (item.get("title") or item.get("section_title") or "").strip()
+
+    titles = [_get_res_title(r) for r in (article_json.get("results") or []) if _get_res_title(r)]
+    return titles
+
+
+
+def _normalize_summary_output(
+    article_json: Dict[str, Any],
+    summary: Any,
+    *,
+    model: str,
+    language: str,
+    header_defaults: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Enforces a stable output contract for downstream writers/UI.
+    - header: guarantees required keys
+    - results: 1:1 ordered by input Results titles
+    - figures: ensures figures.items list exists
+    """
+    if not isinstance(summary, dict):
+        summary = {}
+
+    out: Dict[str, Any] = dict(summary)
+
+    # ---------- header ----------
+    hdr = out.get("header")
+    if not isinstance(hdr, dict):
+        hdr = {}
+
+    if header_defaults:
+        for k, v in header_defaults.items():
+            if k not in hdr or hdr.get(k) in (None, ""):
+                hdr[k] = v
+
+    if not hdr.get("title"):
+        hdr["title"] = str(article_json.get("title", "") or "")
+    if "year" not in hdr or hdr.get("year") in (None, ""):
+        hdr["year"] = article_json.get("year", "")
+
+    hdr["model"] = model
+    hdr["language"] = (language or "").strip().upper()
+    hdr.setdefault("source_path", "")
+    out["header"] = hdr
+
+    # ---------- key_points ----------
+    kp = out.get("key_points")
+    if not isinstance(kp, list):
+        kp = []
+    out["key_points"] = [x.strip() for x in kp if isinstance(x, str) and x.strip()]
+
+    # ---------- introduction / discussion ----------
+    intro = out.get("introduction")
+    disc = out.get("discussion")
+
+    out["introduction"] = intro.strip() if isinstance(intro, str) else ""
+    out["discussion"] = disc.strip() if isinstance(disc, str) else ""
+    
+    # ---------- results ----------
+    expected_titles = _get_results_titles_from_input(article_json)
+    if not expected_titles:
+        raise ValueError("No Results subsections found in input JSON.")
+
+    raw_results = out.get("results")
+    if not isinstance(raw_results, list):
+        raw_results = []
+
+    by_title: Dict[str, str] = {}
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        t = (item.get("section_title") or item.get("title") or item.get("section") or "").strip()
+        s = (item.get("mini_summary") or item.get("summary") or item.get("text") or item.get("content") or "").strip()
+        if t:
+            by_title[t] = s
+
+    out["results"] = [
+        {"section_title": t, "mini_summary": by_title.get(t, "—") or "—"}
+        for t in expected_titles
+    ]
+
+    # ---------- figures ----------
+    figs = out.get("figures")
+    if not isinstance(figs, dict):
+        figs = {}
+
+    items = figs.get("items")
+    if not isinstance(items, list):
+        narrative = figs.get("narrative")
+        if not isinstance(narrative, str):
+            narrative = out.get("figures_narrative") if isinstance(out.get("figures_narrative"), str) else ""
+        narrative = narrative.strip() if isinstance(narrative, str) else ""
+        items = [{"figure": "Figures narrative", "summary": narrative}] if narrative else []
+    else:
+        items = [
+            {
+                "figure": (it.get("figure") or it.get("id") or it.get("name")).strip(),
+                "summary": (it.get("summary") or it.get("text") or it.get("caption_summary")).strip(),
+            }
+            for it in items
+            if isinstance(it, dict)
+            and (it.get("figure") or it.get("id") or it.get("name"))
+            and (it.get("summary") or it.get("text") or it.get("caption_summary"))
+        ]
+
+    figs["items"] = items
+    out["figures"] = figs
+
+    return out
+
+def _split_text_into_chunks(text: str, *, max_chars: int = 6000) -> list[str]:
+    """
+    Split text into chunks <= max_chars, preferably on paragraph boundaries.
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+    paras = [p.strip() for p in t.split("\n\n") if p.strip()]
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
+
+    def flush():
+        nonlocal buf, buf_len
+        if buf:
+            chunks.append("\n\n".join(buf).strip())
+            buf = []
+            buf_len = 0
+
+    for p in paras:
+        if buf_len + len(p) + 2 <= max_chars:
+            buf.append(p)
+            buf_len += len(p) + 2
+        else:
+            flush()
+            # paragraph might be huge; hard-split
+            if len(p) <= max_chars:
+                buf.append(p)
+                buf_len = len(p)
+            else:
+                for i in range(0, len(p), max_chars):
+                    chunks.append(p[i:i + max_chars].strip())
+    flush()
+    return chunks
+
+
+def _summarize_section_chunk(
+    client,
+    *,
+    model: str,
+    language: str,
+    section_name: str,
+    chunk_text: str,
+) -> tuple[str, dict]:
+    """
+    Map step: produce a concise mini-summary for one chunk.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"mini_summary": {"type": "string"}},
+        "required": ["mini_summary"],
+    }
+    lang = (language or "").strip().upper()
+    if lang not in ("EN", "RU"):
+        lang = "EN"
+
+    prompt = f"""
+You summarize scientific text in {lang}.
+SECTION: {section_name}
+
+Task:
+- Write a mini-summary of THIS chunk in your own words.
+- Preserve key concepts and causal links.
+- Do NOT copy sentences verbatim.
+- Do NOT include citations like [1], (1), etc.
+- Keep it concise but information-dense.
+
+Return ONLY valid JSON matching the schema.
+"""
+    out, usage = _call_json_schema(
+        client,
+        model=model,
+        prompt=prompt,
+        payload_obj={"chunk": chunk_text},
+        schema=schema,
+    )
+    ms = (out.get("mini_summary") or "").strip() if isinstance(out, dict) else ""
+    return ms, usage
+
+
+def _reduce_section_summaries(
+    client,
+    *,
+    model: str,
+    language: str,
+    section_name: str,
+    source_len: int,
+    mini_summaries: list[str],
+    target_ratio: float,
+) -> tuple[str, dict]:
+    """
+    Reduce step: merge mini-summaries into a section summary of ~target_ratio of source length.
+    """
+    schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+    lang = (language or "").strip().upper()
+    if lang not in ("EN", "RU"):
+        lang = "EN"
+
+    # target size in characters (rough but effective; docx is text-based)
+    target_chars = max(300, int(source_len * target_ratio))
+    hard_cap = int(target_chars * 1.15)  # allow a bit
+
+    joined = "\n".join(f"- {s}" for s in mini_summaries if s.strip())
+
+    prompt = f"""
+You write a structured scientific summary in {lang}.
+SECTION: {section_name}
+
+Input:
+- A list of mini-summaries (bullet points), each summarizing a chunk.
+
+Task:
+- Merge them into a coherent section summary.
+- Use your own words; do NOT copy from source.
+- Do NOT include citations like [1], (1), etc.
+- Target length: about {target_chars} characters (±15%).
+- Hard cap: {hard_cap} characters.
+
+Return ONLY valid JSON matching the schema.
+"""
+    out, usage = _call_json_schema(
+        client,
+        model=model,
+        prompt=prompt,
+        payload_obj={"mini_summaries": joined},
+        schema=schema,
+    )
+    txt = (out.get("text") or "").strip() if isinstance(out, dict) else ""
+    if len(txt) > hard_cap:
+        txt = txt[:hard_cap].rstrip() + "…"
+    return txt, usage
+
+
+def _summarize_long_section_map_reduce(
+    client,
+    *,
+    model: str,
+    language: str,
+    section_name: str,
+    source_text: str,
+    target_ratio: float,
+    chunk_chars: int = 6000,
+) -> tuple[str, dict]:
+    """
+    Full map-reduce for one long section.
+    """
+    usage_total: dict = {}
+    chunks = _split_text_into_chunks(source_text, max_chars=chunk_chars)
+    if not chunks:
+        return "", usage_total
+
+    minis: list[str] = []
+    for ch in chunks:
+        ms, u = _summarize_section_chunk(
+            client,
+            model=model,
+            language=language,
+            section_name=section_name,
+            chunk_text=ch,
+        )
+        usage_total = _merge_usage(usage_total, u)
+        if ms:
+            minis.append(ms)
+
+    # If something went wrong, still return something non-empty
+    if not minis:
+        minis = [source_text[:500].strip()]
+
+    reduced, u2 = _reduce_section_summaries(
+        client,
+        model=model,
+        language=language,
+        section_name=section_name,
+        source_len=len(source_text),
+        mini_summaries=minis,
+        target_ratio=target_ratio,
+    )
+    usage_total = _merge_usage(usage_total, u2)
+    return reduced, usage_total
+
+def _ensure_key_points(
+    client,
+    *,
+    model: str,
+    language: str,
+    summary: dict,
+) -> tuple[list[str], dict]:
+    """
+    If key_points is empty, generate 3–8 bullets from existing summary content.
+    """
+    usage_total: dict = {}
+    kp = summary.get("key_points")
+    if isinstance(kp, list) and any(isinstance(x, str) and x.strip() for x in kp):
+        return [x.strip() for x in kp if isinstance(x, str) and x.strip()], usage_total
+
+    schema = {
+        "type": "object",
+        "properties": {"key_points": {"type": "array", "items": {"type": "string"}}},
+        "required": ["key_points"],
+    }
+    lang = (language or "").strip().upper()
+    if lang not in ("EN", "RU"):
+        lang = "EN"
+
+    payload = {
+        "introduction": summary.get("introduction", ""),
+        "results": summary.get("results", []),
+        "discussion": summary.get("discussion", ""),
+    }
+
+    prompt = f"""
+You write key points in {lang}.
+Task:
+- Produce 3–8 bullet points capturing the most important findings and takeaways.
+- Do NOT copy sentences verbatim.
+- No citations like [1], (1), etc.
+
+Return ONLY valid JSON matching the schema.
+"""
+    out, u = _call_json_schema(client, model=model, prompt=prompt, payload_obj=payload, schema=schema)
+    usage_total = _merge_usage(usage_total, u)
+
+    pts = out.get("key_points") if isinstance(out, dict) else []
+    if not isinstance(pts, list):
+        pts = []
+    pts = [x.strip() for x in pts if isinstance(x, str) and x.strip()]
+    return pts, usage_total
+
+
+
+# def _looks_extractive(text: str) -> bool:
+#     """
+#     Heuristics: detect likely copy-paste from paper.
+#     We treat citations like [1], [2] or very long paragraphs as extractive.
+#     """
+#     t = (text or "").strip()
+#     if not t:
+#         return True
+#     if re.search(r"\[\d+(\]|\s)", t):  # [1] or [12]
+#         return True
+#     if "et al." in t:
+#         return True
+#     if len(t) > 900:  # слишком длинно для summary-параграфа
+#         return True
+#     return False
+
+
+# def _repair_intro_discussion(
+#     client,
+#     *,
+#     model: str,
+#     language: str,
+#     title: str,
+#     year: Any,
+#     key_points: list[str],
+#     results: list[dict],
+# ) -> tuple[str, str, dict]:
+#     """
+#     Ask the model to rewrite intro/discussion abstractively based on already-generated summary parts.
+#     Returns (introduction, discussion, usage).
+#     """
+#     lang = (language or "").strip().upper()
+#     if lang not in ("EN", "RU"):
+#         lang = "EN"
+
+#     schema = {
+#         "type": "object",
+#         "properties": {
+#             "introduction": {"type": "string"},
+#             "discussion": {"type": "string"},
+#         },
+#         "required": ["introduction", "discussion"],
+#     }
+
+#     payload = {
+#         "title": title,
+#         "year": year,
+#         "key_points": key_points,
+#         "results": results,
+#     }
+
+#     prompt = f"""
+# You are writing an abstractive scientific summary in {lang}.
+# Task: produce ONLY:
+# - introduction: 1 short paragraph (background + objective).
+# - discussion: 1–2 short paragraphs (interpretation, implications, limitations if relevant).
+
+# Hard rules:
+# - DO NOT copy sentences from the paper.
+# - DO NOT include citations like [1], (1), etc.
+# - Do not quote or paste text verbatim.
+# - Use your own words, based on key_points + results summaries.
+# - Be concise.
+
+# Return ONLY valid JSON according to the schema.
+# """
+
+#     out, usage = _call_json_schema(client, model=model, prompt=prompt, payload_obj=payload, schema=schema)
+#     intro = (out.get("introduction") or "").strip() if isinstance(out, dict) else ""
+#     disc = (out.get("discussion") or "").strip() if isinstance(out, dict) else ""
+#     return intro, disc, usage
+
+
+# def _repair_intro_discussion_if_needed(
+#     client,
+#     article_json: dict,
+#     summary: dict,
+#     *,
+#     model: str,
+#     language: str,
+# ) -> tuple[dict, dict]:
+#     """
+#     If intro/discussion are empty or extractive, run a repair LLM call to rewrite them.
+#     Returns (updated_summary, usage_delta).
+#     """
+#     usage_delta: dict = {}
+
+#     intro = summary.get("introduction", "")
+#     disc = summary.get("discussion", "")
+#     intro_s = intro if isinstance(intro, str) else ""
+#     disc_s = disc if isinstance(disc, str) else ""
+
+#     if not _looks_extractive(intro_s) and not _looks_extractive(disc_s):
+#         return summary, usage_delta
+
+#     hdr = summary.get("header") if isinstance(summary.get("header"), dict) else {}
+#     title = str(hdr.get("title") or article_json.get("title") or "")
+#     year = hdr.get("year") if "year" in hdr else article_json.get("year")
+
+#     key_points = summary.get("key_points")
+#     if not isinstance(key_points, list):
+#         key_points = []
+#     key_points = [x.strip() for x in key_points if isinstance(x, str) and x.strip()]
+
+#     results = summary.get("results")
+#     if not isinstance(results, list):
+#         results = []
+
+#     new_intro, new_disc, u = _repair_intro_discussion(
+#         client,
+#         model=model,
+#         language=language,
+#         title=title,
+#         year=year,
+#         key_points=key_points,
+#         results=results,
+#     )
+#     usage_delta = _merge_usage(usage_delta, u)
+
+#     if new_intro:
+#         summary["introduction"] = new_intro
+#     if new_disc:
+#         summary["discussion"] = new_disc
+
+#     return summary, usage_delta
 
 
 # -----------------------------
@@ -464,7 +963,7 @@ def _generate_final_summary_reduce(
     results_titles = [_get_res_title(r) for r in article_json.get("results", []) if _get_res_title(r)]
     # user asked: if empty -> error earlier, but keep safe guard
     if not results_titles:
-        raise ValueError("No Results subsections found in article JSON.")
+        raise ValueError("No Results subsections found in input JSON.")
 
     prompt = f"""
 Generate a structured scientific summary in {lang}.
@@ -478,6 +977,13 @@ IMPORTANT RULES:
 - You MUST preserve Results subsection titles exactly as provided by the parser.
 - You MUST output exactly one Results summary per input Results title, in the same order.
 - Do NOT invent/merge/split/rename any Results subsections.
+
+CONTENT REQUIREMENTS (do NOT leave empty):
+- key_points: 3–8 bullet points.
+- introduction: 1 short paragraph summarizing background + objective.
+- discussion: 1–2 short paragraphs summarizing interpretation/implications/limitations.
+- results: must be filled for every Results title.
+- figures.items: list figure takeaways (can be empty list if no figures).
 
 FIGURE REFERENCES:
 - Preserve NON-supplementary figure references present in mini-summaries/captions.
@@ -508,6 +1014,7 @@ def generate_summary(
     strategy: str = "auto",
     auto_threshold_chars: int = 60000,
     figures_batch_size: int = 10,
+    header_defaults: Optional[Mapping[str, Any]] = None,
 ) -> tuple[dict, dict]:
     """
     strategy:
@@ -518,13 +1025,9 @@ def generate_summary(
     client = get_openai_client()
     usage_total: Dict[str, Any] = {}
 
-    def _get_res_title(item: dict) -> str:
-        return (item.get("title") or item.get("section_title") or "").strip()
-
-    results_titles = [_get_res_title(r) for r in article_json.get("results", []) if _get_res_title(r)]
+    results_titles = _get_results_titles_from_input(article_json)
     if not results_titles:
-        # as you requested: stop and let user fill Results manually
-        raise ValueError("No Results subsections found in article JSON.")
+        raise ValueError("No Results subsections found in input JSON.")
 
     strat = (strategy or "auto").strip().lower()
 
@@ -568,7 +1071,58 @@ OUTPUT FORMAT:
 """
         out, usage = _call_json_schema(client, model=model, prompt=prompt, payload_obj=article_json, schema=SUMMARY_SCHEMA)
         usage_total = _merge_usage(usage_total, usage)
+        
+        out = _normalize_summary_output(
+            article_json,
+            out,
+            model=model,
+            language=language,
+            header_defaults=header_defaults,
+        )
+
+        # --- Introduction/Discussion: map-reduce like Results (target 25–33%) ---
+        src_intro = str(article_json.get("introduction") or "")
+        src_disc = str(article_json.get("discussion") or "")
+
+        intro_ratio = 0.30
+        disc_ratio = 0.30
+
+        intro_txt, u_intro = _summarize_long_section_map_reduce(
+            client,
+            model=model,
+            language=language,
+            section_name="Introduction",
+            source_text=src_intro,
+            target_ratio=intro_ratio,
+        )
+        usage_total = _merge_usage(usage_total, u_intro)
+        if intro_txt:
+            out["introduction"] = intro_txt
+
+        disc_txt, u_disc = _summarize_long_section_map_reduce(
+            client,
+            model=model,
+            language=language,
+            section_name="Discussion",
+            source_text=src_disc,
+            target_ratio=disc_ratio,
+        )
+        usage_total = _merge_usage(usage_total, u_disc)
+        if disc_txt:
+            out["discussion"] = disc_txt
+
+        # --- Ensure key_points are not empty ---
+        kp, u_kp = _ensure_key_points(
+            client,
+            model=model,
+            language=language,
+            summary=out,
+        )
+        usage_total = _merge_usage(usage_total, u_kp)
+        out["key_points"] = kp
+
         return out, usage_total
+
 
     if strat != "hierarchical":
         raise ValueError(f"Unknown strategy: {strategy!r}")
@@ -640,4 +1194,56 @@ OUTPUT FORMAT:
     )
     usage_total = _merge_usage(usage_total, usage)
 
+    final = _normalize_summary_output(
+        article_json,
+        final,
+        model=model,
+        language=language,
+        header_defaults=header_defaults,
+    )
+
+    # --- Introduction/Discussion: map-reduce like Results (target 25–33%) ---
+    src_intro = str(article_json.get("introduction") or "")
+    src_disc = str(article_json.get("discussion") or "")
+
+    intro_ratio = 0.30
+    disc_ratio = 0.30
+
+    intro_txt, u_intro = _summarize_long_section_map_reduce(
+        client,
+        model=model,
+        language=language,
+        section_name="Introduction",
+        source_text=src_intro,
+        target_ratio=intro_ratio,
+    )
+    usage_total = _merge_usage(usage_total, u_intro)
+    if intro_txt:
+        final["introduction"] = intro_txt
+
+    disc_txt, u_disc = _summarize_long_section_map_reduce(
+        client,
+        model=model,
+        language=language,
+        section_name="Discussion",
+        source_text=src_disc,
+        target_ratio=disc_ratio,
+    )
+    usage_total = _merge_usage(usage_total, u_disc)
+    if disc_txt:
+        final["discussion"] = disc_txt
+
+    # --- Ensure key_points are not empty ---
+    kp, u_kp = _ensure_key_points(
+        client,
+        model=model,
+        language=language,
+        summary=final,
+    )
+    usage_total = _merge_usage(usage_total, u_kp)
+    final["key_points"] = kp
+
     return final, usage_total
+
+
+

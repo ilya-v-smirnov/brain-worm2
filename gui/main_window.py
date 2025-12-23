@@ -231,79 +231,12 @@ class MainWindow:
                     model=opts.model,
                     language=opts.language,
                     strategy="auto",
+                    header_defaults={
+                        "source_path": pdf_path_rel,  # путь PDF из БД (зеркалится корректно)
+                    },
                 )
 
-                # --- ensure header exists for docx_writer ---
-                hdr = summary.get("header") if isinstance(summary, dict) else None
-                if not isinstance(hdr, dict):
-                    hdr = {}
-
-                hdr.setdefault("title", data.get("title", ""))
-                hdr.setdefault("year", data.get("year", ""))
-                hdr.setdefault("source_path", pdf_path_rel)   # путь PDF из БД (как хранится)
-                hdr.setdefault("model", opts.model)
-                hdr.setdefault("language", opts.language)
-
-                summary["header"] = hdr
-
-                # --- normalize results shape for docx_writer ---
-                src_results = data.get("results") or []
-                expected_titles = [
-                    (r.get("section_title") or r.get("title") or "").strip()
-                    for r in src_results
-                    if (r.get("section_title") or r.get("title"))
-                ]
-
-                norm_results = []
-                raw_results = summary.get("results") if isinstance(summary, dict) else None
-                if not isinstance(raw_results, list):
-                    raw_results = []
-
-                for item in raw_results:
-                    if not isinstance(item, dict):
-                        continue
-                    title = (item.get("section_title") or item.get("title") or item.get("section") or "").strip()
-                    mini = (item.get("mini_summary") or item.get("text") or item.get("summary") or item.get("content") or "").strip()
-                    if title and mini:
-                        norm_results.append({"section_title": title, "mini_summary": mini})
-
-                # If model returned something weird or titles mismatched, enforce 1:1 using expected_titles
-                if expected_titles:
-                    by_title = {r["section_title"]: r["mini_summary"] for r in norm_results}
-                    norm_results = [{"section_title": t, "mini_summary": by_title.get(t, "—")} for t in expected_titles]
-
-                summary["results"] = norm_results
-
-                # --- normalize figures shape for docx_writer: summary["figures"]["items"] = [{"figure": "...", "summary": "..."}] ---
-                figs = summary.get("figures")
-                if not isinstance(figs, dict):
-                    figs = {}
-
-                items = figs.get("items")
-                if not isinstance(items, list):
-                    # allow if model returned a plain narrative string
-                    narrative = figs.get("narrative") or summary.get("figures_narrative") or ""
-                    narrative = narrative.strip() if isinstance(narrative, str) else ""
-                    items = []
-                    if narrative:
-                        items.append({"figure": "Figures narrative", "summary": narrative})
-                else:
-                    norm_items = []
-                    for it in items:
-                        if not isinstance(it, dict):
-                            continue
-                        figure = (it.get("figure") or it.get("id") or it.get("name") or "").strip()
-                        summ = (it.get("summary") or it.get("text") or it.get("caption_summary") or "").strip()
-                        if figure and summ:
-                            norm_items.append({"figure": figure, "summary": summ})
-                    items = norm_items
-
-                figs["items"] = items
-                summary["figures"] = figs
-
-
                 # 3) write docx (append)
-                from docx_utils.docx_writer import append_ai_summary_to_docx
                 append_ai_summary_to_docx(docx_path=out_docx, summary=summary)
 
                 # 4) update DB path (store rel if possible)
