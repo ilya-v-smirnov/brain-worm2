@@ -1,8 +1,54 @@
 import json
 import re
+import os
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Mapping
 
 from ai_summary.openai_client import get_openai_client
+
+
+# -----------------------------
+# Debug logging (enable with SUMMARY_DEBUG=1)
+# -----------------------------
+_SUMMARY_DEBUG = os.getenv("SUMMARY_DEBUG", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_DBG_MAX_CONSOLE_CHARS = int(os.getenv("SUMMARY_DEBUG_MAX_CHARS", "8000"))  # console safety
+_DBG_DIR = Path(os.getenv("SUMMARY_DEBUG_DIR", "/tmp/brain_worm_llm_logs"))
+_DBG_DIR.mkdir(parents=True, exist_ok=True)
+_DBG_CALL_ID = 0
+
+
+def _dbg_print(msg: str) -> None:
+    if _SUMMARY_DEBUG:
+        print(msg)
+
+
+def _log_llm_output(kind: str, model: str, text: str) -> None:
+    """
+    Writes full raw LLM output to /tmp (or SUMMARY_DEBUG_DIR).
+    Also prints a truncated version to console if SUMMARY_DEBUG=1.
+    """
+    global _DBG_CALL_ID
+    _DBG_CALL_ID += 1
+    call_id = _DBG_CALL_ID
+
+    # Always keep full text in file when debug enabled
+    if _SUMMARY_DEBUG:
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        safe_kind = re.sub(r"[^a-zA-Z0-9_.-]+", "_", kind)[:50]
+        safe_model = re.sub(r"[^a-zA-Z0-9_.-]+", "_", (model or "unknown"))[:60]
+        out_path = _DBG_DIR / f"llm_{ts}_#{call_id}_{safe_kind}_{safe_model}.txt"
+        out_path.write_text(text or "", encoding="utf-8")
+
+        _dbg_print(f"[LLM-OUT] #{call_id} kind={kind} model={model!r} chars={len(text or '')} saved={out_path}")
+
+        # Console output (truncated for safety)
+        t = text or ""
+        if len(t) > _DBG_MAX_CONSOLE_CHARS:
+            _dbg_print(t[:_DBG_MAX_CONSOLE_CHARS] + "\n--- [TRUNCATED] ---\n")
+        else:
+            _dbg_print(t + "\n--- [END] ---\n")
+
 
 MINI_RESULT_SCHEMA = {
     "type": "object",
@@ -34,6 +80,7 @@ SUMMARY_SCHEMA = {
         "figures": {
             "type": "object",
             "properties": {
+                "narrative": {"type": "string"},
                 "items": {
                     "type": "array",
                     "items": {
@@ -44,13 +91,33 @@ SUMMARY_SCHEMA = {
                         },
                         "required": ["figure", "summary"],
                     },
-                }
+                },
             },
-            "required": ["items"],
+            "required": ["narrative", "items"],
+        },
+        "abbreviations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "abbr": {"type": "string"},
+                    "expanded": {"type": "string"},
+                },
+                "required": ["abbr", "expanded"],
+            },
         },
     },
-    "required": ["header", "key_points", "introduction", "results", "discussion", "figures"],
+    "required": [
+        "header",
+        "key_points",
+        "introduction",
+        "results",
+        "discussion",
+        "figures",
+        "abbreviations",
+    ],
 }
+
 
 FIGURES_CHUNK_SCHEMA = {
     "type": "object",
@@ -60,6 +127,30 @@ FIGURES_CHUNK_SCHEMA = {
     },
     "required": ["chunk_id", "narrative"],
 }
+
+
+# -----------------------------
+# Helpers: hard cap for paid LLM calls (runaway cost protection)
+# -----------------------------
+_LLM_CALL_LIMITER = None  # type: Optional[callable]
+
+
+def _set_llm_call_limiter(fn) -> None:
+    """Install a per-run limiter (set by generate_summary)."""
+    global _LLM_CALL_LIMITER
+    _LLM_CALL_LIMITER = fn
+
+
+def _clear_llm_call_limiter() -> None:
+    global _LLM_CALL_LIMITER
+    _LLM_CALL_LIMITER = None
+
+
+def _bump_llm_call() -> None:
+    """Count ONE paid API call attempt (including retries) and abort if over limit."""
+    if _LLM_CALL_LIMITER is not None:
+        _LLM_CALL_LIMITER()
+
 
 
 # -----------------------------
@@ -105,6 +196,33 @@ def _lang_label(language: str) -> str:
         return "English"
     # fallback: pass through as-is
     return language
+
+
+# -----------------------------
+# Helpers: model capabilities
+# -----------------------------
+def _model_supports_schema(model: str) -> bool:
+    """
+    Returns True if the model is expected to reliably support
+    strict JSON-only outputs via response_format / schema prompting.
+
+    IMPORTANT:
+    - GPT-4 / GPT-4.1 class models are UNRELIABLE for strict JSON schemas
+      in long / hierarchical generation → treat as False.
+    - GPT-5.x models are designed for this → True.
+    """
+    if not model:
+        return False
+
+    m = model.lower()
+
+    # Explicit allow-list
+    if m.startswith("gpt-5"):
+        return True
+
+    # Everything else (gpt-4, gpt-4.1, mini, etc.)
+    return False
+
 
 
 def _get_results_titles_from_input(article_json: Dict[str, Any]) -> List[str]:
@@ -174,17 +292,27 @@ def _normalize_summary_output(
         raise ValueError("No Results subsections found in input JSON.")
 
     raw_results = out.get("results")
-    if not isinstance(raw_results, list):
-        raw_results = []
 
     by_title: Dict[str, str] = {}
-    for item in raw_results:
-        if not isinstance(item, dict):
-            continue
-        t = (item.get("section_title") or item.get("title") or item.get("section") or "").strip()
-        s = (item.get("mini_summary") or item.get("summary") or item.get("text") or item.get("content") or "").strip()
-        if t:
-            by_title[t] = s
+
+    # Case A: model returned results as a dict: {"Title 1": "...", "Title 2": "..."}
+    if isinstance(raw_results, dict):
+        for k, v in raw_results.items():
+            t = str(k or "").strip()
+            s = str(v or "").strip()
+            if t:
+                by_title[t] = s
+
+    # Case B: model returned results as a list of objects
+    elif isinstance(raw_results, list):
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            t = (item.get("section_title") or item.get("title") or item.get("section") or "").strip()
+            s = (item.get("mini_summary") or item.get("summary") or item.get("text") or item.get("content") or "").strip()
+            if t:
+                by_title[t] = s
+
 
     out["results"] = [
         {"section_title": t, "mini_summary": by_title.get(t, "—") or "—"}
@@ -196,29 +324,68 @@ def _normalize_summary_output(
     if not isinstance(figs, dict):
         figs = {}
 
+    # narrative (string, always present)
+    narrative = figs.get("narrative")
+    if not isinstance(narrative, str):
+        # backward/legacy fallbacks
+        legacy = out.get("figures_narrative")
+        narrative = legacy if isinstance(legacy, str) else ""
+    narrative = narrative.strip() if isinstance(narrative, str) else ""
+
+    # items (list[{"figure","summary"}], always present)
     items = figs.get("items")
     if not isinstance(items, list):
-        narrative = figs.get("narrative")
-        if not isinstance(narrative, str):
-            narrative = out.get("figures_narrative") if isinstance(out.get("figures_narrative"), str) else ""
-        narrative = narrative.strip() if isinstance(narrative, str) else ""
-        items = [{"figure": "Figures narrative", "summary": narrative}] if narrative else []
+        items = []
     else:
         items = [
             {
-                "figure": (it.get("figure") or it.get("id") or it.get("name")).strip(),
-                "summary": (it.get("summary") or it.get("text") or it.get("caption_summary")).strip(),
+                "figure": (it.get("figure") or it.get("id") or it.get("name") or "").strip(),
+                "summary": (it.get("summary") or it.get("text") or it.get("caption_summary") or "").strip(),
             }
             for it in items
             if isinstance(it, dict)
-            and (it.get("figure") or it.get("id") or it.get("name"))
-            and (it.get("summary") or it.get("text") or it.get("caption_summary"))
         ]
+        items = [it for it in items if it["figure"] and it["summary"]]
 
+    figs["narrative"] = narrative
     figs["items"] = items
     out["figures"] = figs
 
+    # ---------- abbreviations ----------
+    # Accept:
+    # - list[{"abbr": "...", "expanded": "..."}]
+    # - dict {"ABBR": "expanded", ...} (legacy/convenience)
+    raw_abbr = out.get("abbreviations")
+    pairs: list[tuple[str, str]] = []
+
+    if isinstance(raw_abbr, dict):
+        for k, v in raw_abbr.items():
+            ab = str(k).strip()
+            ex = str(v).strip() if v is not None else ""
+            if ab and ex:
+                pairs.append((ab, ex))
+    elif isinstance(raw_abbr, list):
+        for it in raw_abbr:
+            if not isinstance(it, dict):
+                continue
+            ab = (it.get("abbr") or it.get("abbreviation") or it.get("short") or "").strip()
+            ex = (it.get("expanded") or it.get("expansion") or it.get("long") or "").strip()
+            if ab and ex:
+                pairs.append((ab, ex))
+
+    # de-dup by abbr (case-insensitive), keep first non-empty expanded
+    dedup: dict[str, tuple[str, str]] = {}
+    for ab, ex in pairs:
+        key = ab.casefold()
+        if key not in dedup:
+            dedup[key] = (ab, ex)
+
+    abbr_list = [{"abbr": ab, "expanded": ex} for (ab, ex) in dedup.values()]
+    abbr_list.sort(key=lambda d: d["abbr"].casefold())
+    out["abbreviations"] = abbr_list
+
     return out
+
 
 def _split_text_into_chunks(text: str, *, max_chars: int = 6000) -> list[str]:
     """
@@ -453,134 +620,6 @@ Return ONLY valid JSON matching the schema.
     return pts, usage_total
 
 
-
-# def _looks_extractive(text: str) -> bool:
-#     """
-#     Heuristics: detect likely copy-paste from paper.
-#     We treat citations like [1], [2] or very long paragraphs as extractive.
-#     """
-#     t = (text or "").strip()
-#     if not t:
-#         return True
-#     if re.search(r"\[\d+(\]|\s)", t):  # [1] or [12]
-#         return True
-#     if "et al." in t:
-#         return True
-#     if len(t) > 900:  # слишком длинно для summary-параграфа
-#         return True
-#     return False
-
-
-# def _repair_intro_discussion(
-#     client,
-#     *,
-#     model: str,
-#     language: str,
-#     title: str,
-#     year: Any,
-#     key_points: list[str],
-#     results: list[dict],
-# ) -> tuple[str, str, dict]:
-#     """
-#     Ask the model to rewrite intro/discussion abstractively based on already-generated summary parts.
-#     Returns (introduction, discussion, usage).
-#     """
-#     lang = (language or "").strip().upper()
-#     if lang not in ("EN", "RU"):
-#         lang = "EN"
-
-#     schema = {
-#         "type": "object",
-#         "properties": {
-#             "introduction": {"type": "string"},
-#             "discussion": {"type": "string"},
-#         },
-#         "required": ["introduction", "discussion"],
-#     }
-
-#     payload = {
-#         "title": title,
-#         "year": year,
-#         "key_points": key_points,
-#         "results": results,
-#     }
-
-#     prompt = f"""
-# You are writing an abstractive scientific summary in {lang}.
-# Task: produce ONLY:
-# - introduction: 1 short paragraph (background + objective).
-# - discussion: 1–2 short paragraphs (interpretation, implications, limitations if relevant).
-
-# Hard rules:
-# - DO NOT copy sentences from the paper.
-# - DO NOT include citations like [1], (1), etc.
-# - Do not quote or paste text verbatim.
-# - Use your own words, based on key_points + results summaries.
-# - Be concise.
-
-# Return ONLY valid JSON according to the schema.
-# """
-
-#     out, usage = _call_json_schema(client, model=model, prompt=prompt, payload_obj=payload, schema=schema)
-#     intro = (out.get("introduction") or "").strip() if isinstance(out, dict) else ""
-#     disc = (out.get("discussion") or "").strip() if isinstance(out, dict) else ""
-#     return intro, disc, usage
-
-
-# def _repair_intro_discussion_if_needed(
-#     client,
-#     article_json: dict,
-#     summary: dict,
-#     *,
-#     model: str,
-#     language: str,
-# ) -> tuple[dict, dict]:
-#     """
-#     If intro/discussion are empty or extractive, run a repair LLM call to rewrite them.
-#     Returns (updated_summary, usage_delta).
-#     """
-#     usage_delta: dict = {}
-
-#     intro = summary.get("introduction", "")
-#     disc = summary.get("discussion", "")
-#     intro_s = intro if isinstance(intro, str) else ""
-#     disc_s = disc if isinstance(disc, str) else ""
-
-#     if not _looks_extractive(intro_s) and not _looks_extractive(disc_s):
-#         return summary, usage_delta
-
-#     hdr = summary.get("header") if isinstance(summary.get("header"), dict) else {}
-#     title = str(hdr.get("title") or article_json.get("title") or "")
-#     year = hdr.get("year") if "year" in hdr else article_json.get("year")
-
-#     key_points = summary.get("key_points")
-#     if not isinstance(key_points, list):
-#         key_points = []
-#     key_points = [x.strip() for x in key_points if isinstance(x, str) and x.strip()]
-
-#     results = summary.get("results")
-#     if not isinstance(results, list):
-#         results = []
-
-#     new_intro, new_disc, u = _repair_intro_discussion(
-#         client,
-#         model=model,
-#         language=language,
-#         title=title,
-#         year=year,
-#         key_points=key_points,
-#         results=results,
-#     )
-#     usage_delta = _merge_usage(usage_delta, u)
-
-#     if new_intro:
-#         summary["introduction"] = new_intro
-#     if new_disc:
-#         summary["discussion"] = new_disc
-
-#     return summary, usage_delta
-
-
 # -----------------------------
 # Helpers: figure references
 # -----------------------------
@@ -700,17 +739,13 @@ def _call_json_schema(
     schema: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Any]:
     """
-    SDK compatibility:
-    - If Responses API supports json_schema formatting, great (not in your SDK).
-    - If not, we request "JSON only" and parse with json.loads.
-    - Fallback to Chat Completions if Responses API is unavailable.
+    HARD RULE: exactly ONE paid API call per request.
+    We use Chat Completions only (no Responses API fallback) to avoid double-billing.
     """
-    # We still keep schema arg to preserve call sites, but we enforce JSON via prompt.
     payload_text = json.dumps(payload_obj, ensure_ascii=False)
 
-    # Make the prompt self-enforcing: JSON only, no markdown.
     enforced_prompt = (
-        prompt.strip()
+        prompt
         + "\n\n"
         + "CRITICAL OUTPUT RULE:\n"
         + "- Return ONLY a single valid JSON object.\n"
@@ -718,36 +753,7 @@ def _call_json_schema(
         + "- Ensure the JSON is strictly parseable by json.loads.\n"
     )
 
-    # First try Responses API with minimal args (no text_format/response_format)
-    try:
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": enforced_prompt},
-                        {"type": "input_text", "text": payload_text},
-                    ],
-                }
-            ],
-        )
-        usage = getattr(resp, "usage", None)
-        txt = _extract_response_text(resp)
-        txt = _strip_json_fence(txt)
-        parsed = json.loads(txt)
-        return parsed, usage
-    except TypeError:
-        # This happens if the SDK's responses.create signature is different.
-        pass
-    except Exception:
-        # If the call succeeded but parsing failed, re-raise with raw output below.
-        # We'll handle by trying chat completions; if that also fails, raise.
-        try_chat = True
-    else:
-        try_chat = False
-
-    # Fallback: Chat Completions
+    # One call only
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -755,10 +761,11 @@ def _call_json_schema(
                 {"role": "user", "content": enforced_prompt},
                 {"role": "user", "content": payload_text},
             ],
-            # Some SDKs support forcing JSON object; if not, will error and we retry without it.
             response_format={"type": "json_object"},
+            timeout=60,
         )
     except TypeError:
+        # Older SDKs may not support response_format/timeout kwargs
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -768,13 +775,80 @@ def _call_json_schema(
         )
 
     usage = getattr(resp, "usage", None)
-    txt = _extract_response_text(resp)
+
+    # Extract text
+    txt = ""
+    try:
+        # OpenAI-style: resp.choices[0].message.content
+        choices = getattr(resp, "choices", None) or []
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            txt = (getattr(msg, "content", None) or "").strip()
+    except Exception:
+        txt = ""
+
     txt = _strip_json_fence(txt)
+
+    # DEBUG: show raw model output
+    _log_llm_output(kind="json_schema", model=model, text=txt)
+
     try:
         parsed = json.loads(txt)
     except Exception as ex:
-        raise RuntimeError(f"Failed to parse model JSON output. Raw output:\n{txt}") from ex
+        # Important: dump raw output for debugging (already saved), then raise
+        raise RuntimeError(f"Failed to parse model JSON output. Raw output saved to {_DBG_DIR}.") from ex
+
+    # DEBUG: minimal structure info
+    try:
+        if isinstance(parsed, dict):
+            _dbg_print(f"[LLM-PARSED] keys={sorted(list(parsed.keys()))}")
+            if "results" in parsed and isinstance(parsed["results"], list):
+                _dbg_print(f"[LLM-PARSED] results_items={len(parsed['results'])}")
+    except Exception:
+        pass
+
     return parsed, usage
+
+
+
+def _call_text(
+    client,
+    *,
+    model: str,
+    prompt: str,
+    timeout_s: int = 60,
+) -> tuple[str, Any]:
+    """
+    Text-only call via Chat Completions (single call, no Responses API).
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=timeout_s,
+        )
+    except TypeError:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+    usage = getattr(resp, "usage", None)
+
+    txt = ""
+    try:
+        choices = getattr(resp, "choices", None) or []
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            txt = (getattr(msg, "content", None) or "").strip()
+    except Exception:
+        txt = ""
+
+    # DEBUG: show raw model output
+    _log_llm_output(kind="text", model=model, text=txt)
+
+    return txt, usage
+
 
 
 # -----------------------------
@@ -787,77 +861,130 @@ def _generate_result_mini_summary(
     language: str,
     section_title: str,
     section_text: str,
-) -> Tuple[Dict[str, Any], Any]:
+) -> Tuple[Dict[str, str], Any]:
+    """
+    MAP step for one Results subsection.
+    - GPT-5.x: JSON-only via _call_json_schema
+    - others: text-only via _call_text
+    """
     lang = _lang_label(language)
 
     required_refs = extract_non_supp_figure_refs(section_text)
-
     refs_clause = ""
     if required_refs:
-        # Provide exact refs and ask model to keep them unchanged.
-        refs_joined = "; ".join(required_refs)
-        refs_clause = f"""
-FIGURE REFERENCES (MANDATORY):
-- The source text contains these NON-supplementary figure references:
-  {refs_joined}
-- You MUST include EVERY ONE of them in the mini-summary.
-- Keep them in the SAME textual form (copy/paste), do not reformat, renumber, or paraphrase.
-- Do NOT include Supplementary/Appendix/Extended Data figure references.
-"""
+        refs_clause = (
+            "\nFIGURE REFS (mandatory if present in section_text):\n"
+            + "- Include these NON-supplementary refs verbatim: "
+            + "; ".join(sorted(set(required_refs)))
+            + "\n- Do NOT include supplementary refs (Fig. S..., Supplementary Fig...).\n"
+        )
 
-    prompt = f"""
-Write a concise scientific mini-summary in {lang} for ONE Results subsection.
+    # ---------- text-only fallback ----------
+    if not _model_supports_schema(model):
+        prompt_text = f"""
+You write a compact scientific mini-summary in {lang} for ONE Results subsection.
 
-INPUT:
-- You will receive a JSON with:
-  - section_title (string)
-  - section_text (string)
+SECTION TITLE:
+{section_title}
 
-HARD RULES (non-negotiable):
-- Output MUST be valid JSON following the provided schema, and nothing else.
-- section_title in output MUST exactly equal the input section_title.
-- Do NOT invent any data not present in section_text.
-- Preserve all NON-supplementary figure references that appear in the source text.
-- Ignore any supplementary figure references (e.g., Fig. S1, Supplementary Fig. 2).
+SECTION TEXT:
+{section_text}
 
+RULES:
+- 2–5 sentences.
+- Do NOT output placeholders like "—" or "-".
+- Do NOT repeat the title.
+- Do NOT include supplementary figure refs.
 {refs_clause}
 
-CONTENT:
-- State the main claim(s).
-- Briefly mention the evidence/measurements/observations supporting the claim(s).
-- Keep it compact and technical.
+Return ONLY the mini-summary text.
+"""
+        text, usage = _call_text(client, model=model, prompt=prompt_text, timeout_s=60)
+        mini = (text or "").strip()
+        if not mini or mini in {"—", "-", "–"} or len(mini) < 10:
+            mini = "Summary generation failed."
+        return {"section_title": section_title, "mini_summary": mini}, usage
 
-OUTPUT JSON SCHEMA:
+    # ---------- GPT-5.x JSON path ----------
+    prompt = f"""
+You write a compact scientific mini-summary in {lang} for ONE Results subsection.
+
+INPUT JSON contains:
+- section_title: str
+- section_text: str
+
+HARD RULES:
+- Preserve section_title EXACTLY.
+- mini_summary must be 2–5 sentences.
+- Do NOT output placeholders like "—" or "-" or empty output.
+- Do NOT include supplementary figure refs.
+{refs_clause}
+
+Return ONLY valid JSON:
 {{"section_title": "...", "mini_summary": "..."}}
 """
-
     payload = {"section_title": section_title, "section_text": section_text}
-    out, usage = _call_json_schema(client, model=model, prompt=prompt, payload_obj=payload, schema=MINI_RESULT_SCHEMA)
+    out, usage = _call_json_schema(
+        client,
+        model=model,
+        prompt=prompt,
+        payload_obj=payload,
+        schema=MINI_RESULT_SCHEMA,
+    )
 
-    # Post-check / repair: ensure figure refs preserved
-    ok, missing = _contains_all_refs(out.get("mini_summary", ""), required_refs)
-    if ok:
-        return out, usage
+    ms = (out.get("mini_summary") or "").strip() if isinstance(out, dict) else ""
+    if not ms or ms in {"—", "-", "–"} or len(ms) < 10:
+        # one retry
+        regen_prompt = f"""
+Your previous mini_summary was empty/placeholder or too short.
 
-    repair_prompt = f"""
-You previously wrote a mini-summary but missed some REQUIRED non-supplementary figure references.
+Return ONLY valid JSON:
+{{"section_title": "{section_title}", "mini_summary": "..."}}
 
-TASK:
-- Return ONLY valid JSON following the schema.
-- Keep section_title EXACTLY the same.
-- Update mini_summary to include the missing figure references EXACTLY as provided.
-- Do NOT add any supplementary figure references.
-- Keep length similar; do not add new claims.
-
-MISSING REFS (must appear verbatim):
-{"; ".join(missing)}
+Rules:
+- 2–5 sentences, based ONLY on section_text.
+- No supplementary refs.
+{refs_clause}
 """
-    repair_payload = {
-        "section_title": out.get("section_title", section_title),
-        "mini_summary": out.get("mini_summary", ""),
-    }
-    repaired, usage2 = _call_json_schema(client, model=model, prompt=repair_prompt, payload_obj=repair_payload, schema=MINI_RESULT_SCHEMA)
-    return repaired, (usage, usage2)
+        out2, usage2 = _call_json_schema(
+            client,
+            model=model,
+            prompt=regen_prompt,
+            payload_obj=payload,
+            schema=MINI_RESULT_SCHEMA,
+        )
+        out = out2
+        usage = (usage, usage2)
+
+    # Enforce refs if needed
+    if required_refs:
+        ok, missing = _contains_all_refs(out.get("mini_summary", ""), required_refs)
+        if not ok and missing:
+            repair_prompt = f"""
+You missed required NON-supplementary figure references.
+
+Return ONLY valid JSON:
+{{"section_title": "{section_title}", "mini_summary": "..."}}
+
+Include these refs verbatim:
+{"; ".join(missing)}
+
+No supplementary refs. 2–5 sentences.
+"""
+            repaired, usage3 = _call_json_schema(
+                client,
+                model=model,
+                prompt=repair_prompt,
+                payload_obj={
+                    "section_title": section_title,
+                    "mini_summary": out.get("mini_summary", ""),
+                },
+                schema=MINI_RESULT_SCHEMA,
+            )
+            return repaired, (usage, usage3)
+
+    return out, usage
+
 
 
 # -----------------------------
@@ -993,12 +1120,20 @@ OUTPUT:
 - Return ONLY valid JSON following the provided schema (no extra text).
 """
 
+    compact_article = {
+    "title": article_json.get("title", ""),
+    "year": article_json.get("year", ""),
+    "introduction": (article_json.get("introduction") or "")[:4000],  # small context only
+    "discussion": (article_json.get("discussion") or "")[:4000],      # small context only
+    }
+
     payload = {
-        "article_json": article_json,
+        "article": compact_article,
         "results_titles": results_titles,
         "results_mini": results_mini,
-        "figures_narrative": figures_narrative,
+        "figures_narrative": '',
     }
+
     out, usage = _call_json_schema(client, model=model, prompt=prompt, payload_obj=payload, schema=SUMMARY_SCHEMA)
     return out, usage
 
@@ -1023,23 +1158,45 @@ def generate_summary(
       - "hierarchical": map-reduce
     """
     client = get_openai_client()
-    usage_total: Dict[str, Any] = {}
+    # SAFETY: hard cap on number of LLM calls per run
+    # Prevents runaway costs if something goes wrong upstream.
+    MAX_LLM_CALLS = 25
+    llm_calls = 0
 
-    results_titles = _get_results_titles_from_input(article_json)
-    if not results_titles:
-        raise ValueError("No Results subsections found in input JSON.")
+    def _bump_calls():
+        nonlocal llm_calls
+        llm_calls += 1
+        if llm_calls > MAX_LLM_CALLS:
+            raise RuntimeError(
+                f"Safety stop: exceeded MAX_LLM_CALLS={MAX_LLM_CALLS}. "
+                "Generation aborted to prevent runaway costs."
+            )
 
-    strat = (strategy or "auto").strip().lower()
+    _set_llm_call_limiter(_bump_calls)
+    try:
+        usage_total: Dict[str, Any] = {}
 
-    # Decide auto
-    if strat == "auto":
-        approx_size = len(json.dumps(article_json, ensure_ascii=False))
-        strat = "single_shot" if approx_size < auto_threshold_chars else "hierarchical"
+        results_titles = _get_results_titles_from_input(article_json)
+        if not results_titles:
+            raise ValueError("No Results subsections found in input JSON.")
 
-    if strat == "single_shot":
-        # Keep existing single-shot prompt but make language consistent label
-        lang = _lang_label(language)
-        prompt = f"""
+        strat = (strategy or "auto").strip().lower()
+
+        # Decide auto
+        if strat == "auto":
+            # IMPORTANT:
+            # GPT-4 class models are much less reliable in "single_shot" for preserving 1:1 Results subsections.
+            # Force hierarchical map-reduce to guarantee non-empty per-subsection Results.
+            if not _model_supports_schema(model):
+                strat = "hierarchical"
+            else:
+                approx_size = len(json.dumps(article_json, ensure_ascii=False))
+                strat = "single_shot" if approx_size < auto_threshold_chars else "hierarchical"
+
+        if strat == "single_shot":
+            # Keep existing single-shot prompt but make language consistent label
+            lang = _lang_label(language)
+            prompt = f"""
 Generate a structured scientific summary in {lang}.
 
 You are given a scientific article already parsed into a structured JSON object.
@@ -1069,12 +1226,125 @@ OUTPUT FORMAT:
 - The JSON MUST strictly follow the provided schema.
 - Do NOT include any explanatory text outside the JSON.
 """
-        out, usage = _call_json_schema(client, model=model, prompt=prompt, payload_obj=article_json, schema=SUMMARY_SCHEMA)
+            out, usage = _call_json_schema(client, model=model, prompt=prompt, payload_obj=article_json, schema=SUMMARY_SCHEMA)
+            usage_total = _merge_usage(usage_total, usage)
+
+            out = _normalize_summary_output(
+                article_json,
+                out,
+                model=model,
+                language=language,
+                header_defaults=header_defaults,
+            )
+
+            # --- Introduction/Discussion: map-reduce like Results (target 25–33%) ---
+
+            # If the reduce step already produced non-empty intro/discussion, keep them.
+            # Otherwise, fall back to map-reduce.
+            if not final.get("introduction", "").strip():
+                src_intro = str(article_json.get("introduction") or "")
+                intro_txt, u_intro = _summarize_long_section_map_reduce(
+                    client,
+                    model=model,
+                    language=language,
+                    section_name="Introduction",
+                    source_text=src_intro,
+                    target_ratio=0.30,
+                )
+                usage_total = _merge_usage(usage_total, u_intro)
+                if intro_txt:
+                    final["introduction"] = intro_txt
+
+            if not final.get("discussion", "").strip():
+                src_disc = str(article_json.get("discussion") or "")
+                disc_txt, u_disc = _summarize_long_section_map_reduce(
+                    client,
+                    model=model,
+                    language=language,
+                    section_name="Discussion",
+                    source_text=src_disc,
+                    target_ratio=0.30,
+                )
+                usage_total = _merge_usage(usage_total, u_disc)
+                if disc_txt:
+                    final["discussion"] = disc_txt
+
+            usage_total = _merge_usage(usage_total, u_disc)
+            if disc_txt:
+                out["discussion"] = disc_txt
+
+            # --- Ensure key_points are not empty ---
+            kp, u_kp = _ensure_key_points(
+                client,
+                model=model,
+                language=language,
+                summary=out,
+            )
+            usage_total = _merge_usage(usage_total, u_kp)
+            out["key_points"] = kp
+
+            return out, usage_total
+
+
+        if strat != "hierarchical":
+            raise ValueError(f"Unknown strategy: {strategy!r}")
+
+        # -------------------------
+        # MAP: results mini-summaries
+        # -------------------------
+        results_mini: List[Dict[str, str]] = []
+        for r in article_json.get("results", []):
+            title = (r.get("title") or r.get("section_title") or "").strip()
+            text = (r.get("text") or r.get("section_text") or "").strip()
+            if not title:
+                continue
+
+            mini, usage = _generate_result_mini_summary(
+                client,
+                model=model,
+                language=language,
+                section_title=title,
+                section_text=text,
+            )
+            # usage may be tuple (usage1, usage2) after repair
+            if isinstance(usage, tuple):
+                for u in usage:
+                    usage_total = _merge_usage(usage_total, u)
+            else:
+                usage_total = _merge_usage(usage_total, usage)
+
+            results_mini.append(
+                {"section_title": mini["section_title"], "mini_summary": mini["mini_summary"]}
+            )
+
+        # Hard guard: 1:1 titles
+        got_titles = [x["section_title"] for x in results_mini]
+        if got_titles != results_titles:
+            raise RuntimeError(
+                "Internal error: Results mini-summaries titles/order mismatch.\n"
+                f"Expected: {results_titles}\nGot: {got_titles}"
+            )
+
+        # -------------------------
+        # MAP: figures narrative chunks (Approach 2)
+        # -------------------------
+        figures = ""
+        # -------------------------
+        # REDUCE: final structured summary
+        # -------------------------
+        final, usage = _generate_final_summary_reduce(
+            client,
+            model=model,
+            language=language,
+            article_json=article_json,
+            results_mini=results_mini,
+            figures_narrative="",
+        )
         usage_total = _merge_usage(usage_total, usage)
-        
-        out = _normalize_summary_output(
+
+        final = _normalize_summary_output(
             article_json,
-            out,
+            final,
             model=model,
             language=language,
             header_defaults=header_defaults,
@@ -1097,7 +1367,7 @@ OUTPUT FORMAT:
         )
         usage_total = _merge_usage(usage_total, u_intro)
         if intro_txt:
-            out["introduction"] = intro_txt
+            final["introduction"] = intro_txt
 
         disc_txt, u_disc = _summarize_long_section_map_reduce(
             client,
@@ -1109,141 +1379,20 @@ OUTPUT FORMAT:
         )
         usage_total = _merge_usage(usage_total, u_disc)
         if disc_txt:
-            out["discussion"] = disc_txt
+            final["discussion"] = disc_txt
 
         # --- Ensure key_points are not empty ---
         kp, u_kp = _ensure_key_points(
             client,
             model=model,
             language=language,
-            summary=out,
+            summary=final,
         )
         usage_total = _merge_usage(usage_total, u_kp)
-        out["key_points"] = kp
+        final["key_points"] = kp
 
-        return out, usage_total
-
-
-    if strat != "hierarchical":
-        raise ValueError(f"Unknown strategy: {strategy!r}")
-
-    # -------------------------
-    # MAP: results mini-summaries
-    # -------------------------
-    results_mini: List[Dict[str, str]] = []
-    for r in article_json.get("results", []):
-        title = (r.get("title") or r.get("section_title") or "").strip()
-        text = (r.get("text") or r.get("section_text") or "").strip()
-        if not title:
-            continue
-
-        mini, usage = _generate_result_mini_summary(
-            client,
-            model=model,
-            language=language,
-            section_title=title,
-            section_text=text,
-        )
-        # usage may be tuple (usage1, usage2) after repair
-        if isinstance(usage, tuple):
-            for u in usage:
-                usage_total = _merge_usage(usage_total, u)
-        else:
-            usage_total = _merge_usage(usage_total, usage)
-
-        results_mini.append(
-            {"section_title": mini["section_title"], "mini_summary": mini["mini_summary"]}
-        )
-
-    # Hard guard: 1:1 titles
-    got_titles = [x["section_title"] for x in results_mini]
-    if got_titles != results_titles:
-        raise RuntimeError(
-            "Internal error: Results mini-summaries titles/order mismatch.\n"
-            f"Expected: {results_titles}\nGot: {got_titles}"
-        )
-
-    # -------------------------
-    # MAP: figures narrative chunks (Approach 2)
-    # -------------------------
-    figures = article_json.get("figures", []) or []
-    chunks: List[str] = []
-    if figures:
-        chunks, usages = _generate_figures_narrative_chunks(
-            client,
-            model=model,
-            language=language,
-            figures=figures,
-            results_mini=results_mini,
-            batch_size=figures_batch_size,
-        )
-        for u in usages:
-            usage_total = _merge_usage(usage_total, u)
-    figures_narrative = "\n\n".join([c for c in chunks if c]).strip()
-
-    # -------------------------
-    # REDUCE: final structured summary
-    # -------------------------
-    final, usage = _generate_final_summary_reduce(
-        client,
-        model=model,
-        language=language,
-        article_json=article_json,
-        results_mini=results_mini,
-        figures_narrative=figures_narrative,
-    )
-    usage_total = _merge_usage(usage_total, usage)
-
-    final = _normalize_summary_output(
-        article_json,
-        final,
-        model=model,
-        language=language,
-        header_defaults=header_defaults,
-    )
-
-    # --- Introduction/Discussion: map-reduce like Results (target 25–33%) ---
-    src_intro = str(article_json.get("introduction") or "")
-    src_disc = str(article_json.get("discussion") or "")
-
-    intro_ratio = 0.30
-    disc_ratio = 0.30
-
-    intro_txt, u_intro = _summarize_long_section_map_reduce(
-        client,
-        model=model,
-        language=language,
-        section_name="Introduction",
-        source_text=src_intro,
-        target_ratio=intro_ratio,
-    )
-    usage_total = _merge_usage(usage_total, u_intro)
-    if intro_txt:
-        final["introduction"] = intro_txt
-
-    disc_txt, u_disc = _summarize_long_section_map_reduce(
-        client,
-        model=model,
-        language=language,
-        section_name="Discussion",
-        source_text=src_disc,
-        target_ratio=disc_ratio,
-    )
-    usage_total = _merge_usage(usage_total, u_disc)
-    if disc_txt:
-        final["discussion"] = disc_txt
-
-    # --- Ensure key_points are not empty ---
-    kp, u_kp = _ensure_key_points(
-        client,
-        model=model,
-        language=language,
-        summary=final,
-    )
-    usage_total = _merge_usage(usage_total, u_kp)
-    final["key_points"] = kp
-
-    return final, usage_total
-
+        return final, usage_total
+    finally:
+        _clear_llm_call_limiter()
 
 

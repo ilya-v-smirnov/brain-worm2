@@ -1,10 +1,135 @@
 from __future__ import annotations
 
+import json
 from docx import Document
 from docx.shared import Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
+from pathlib import Path
+
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class DocxStyleProfile:
+    # Title (H1)
+    h1_space_before: int = 0
+    h1_space_after: int = 2
+    h1_line_spacing: float = 1.0
+
+    # Section headers
+    h2_space_before: int = 6
+    h2_space_after: int = 2
+    h3_space_before: int = 4
+    h3_space_after: int = 0
+
+    # Body paragraphs
+    body_align: int = WD_ALIGN_PARAGRAPH.JUSTIFY
+    body_space_after: int = 6         # больше воздуха между абзацами
+    body_line_spacing: float = 1.0
+
+    # Meta lines (e.g., Source path)
+    meta_align: int = WD_ALIGN_PARAGRAPH.LEFT
+    meta_space_after: int = 2
+
+    # Figures
+    figure_align: int = WD_ALIGN_PARAGRAPH.JUSTIFY
+    figure_space_after: int = 6
+
+DEFAULT_STYLE = DocxStyleProfile()
+
+
+def _apply_paragraph_style(p, *, align=None, space_before=None, space_after=None, line_spacing=None) -> None:
+    pf = p.paragraph_format
+    if align is not None:
+        p.alignment = align
+    if space_before is not None:
+        pf.space_before = Pt(space_before)
+    if space_after is not None:
+        pf.space_after = Pt(space_after)
+    if line_spacing is not None:
+        pf.line_spacing = line_spacing
+        pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+
+def _apply_h1(p, style: DocxStyleProfile) -> None:
+    _apply_paragraph_style(
+        p,
+        align=WD_ALIGN_PARAGRAPH.LEFT,
+        space_before=style.h1_space_before,
+        space_after=style.h1_space_after,
+        line_spacing=style.h1_line_spacing,
+    )
+
+
+def _apply_meta(p, style: DocxStyleProfile) -> None:
+    _apply_paragraph_style(
+        p,
+        align=style.meta_align,
+        space_before=0,
+        space_after=style.meta_space_after,
+        line_spacing=1.0,
+    )
+
+
+def _apply_body(p, style: DocxStyleProfile) -> None:
+    _apply_paragraph_style(
+        p,
+        align=style.body_align,
+        space_before=0,
+        space_after=style.body_space_after,
+        line_spacing=style.body_line_spacing,
+    )
+
+
+def _apply_figure(p, style: DocxStyleProfile) -> None:
+    _apply_paragraph_style(
+        p,
+        align=style.figure_align,
+        space_before=0,
+        space_after=style.figure_space_after,
+        line_spacing=1.0,
+    )
+
 
 # --- Базовые помощники -------------------------------------------------------
+
+def _normalize_word_breaks(text: str) -> str:
+    """
+    Нормализует Word-переносы в "абзацы" (paragraph breaks).
+
+    Что ловим:
+    - literal token "^l" -> абзац
+    - VT / vertical tab '\x0b' -> абзац
+    - Unicode line/paragraph separators: U+2028, U+2029 -> абзац
+    - CRLF/CR -> LF
+    - одиночные '\n' внутри "сплошного" текста часто означают ^l: конвертируем в абзацы,
+      но сохраняем уже существующие двойные пустые строки как разделители абзацев.
+    """
+    if not text:
+        return ""
+    s = str(text)
+
+    # Normalize newlines
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Word-like manual breaks
+    s = s.replace("^l", "\n\n")
+    s = s.replace("\x0b", "\n\n")         # vertical tab
+    s = s.replace("\u2028", "\n\n")       # line separator
+    s = s.replace("\u2029", "\n\n")       # paragraph separator
+
+    # Если текст содержит одиночные переносы строк, делаем их абзацами.
+    # При этом не ломаем уже имеющиеся двойные переносы.
+    # Принцип:
+    #   - сначала временно защищаем \n\n
+    #   - затем все одиночные \n превращаем в \n\n
+    #   - возвращаем защищённые
+    sentinel = "\uFFFF"  # unlikely character
+    s = s.replace("\n\n", sentinel)
+    s = s.replace("\n", "\n\n")
+    s = s.replace(sentinel, "\n\n")
+
+    return s
+
 
 def _p(doc: Document, text: str = "", *, bold: bool = False, size: int = 11, font: str | None = None):
     para = doc.add_paragraph()
@@ -45,7 +170,7 @@ def _bullet_list(doc: Document, items):
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         p.paragraph_format.space_after = Pt(0)
 
-def _sections_block(doc: Document, sections: List[Dict[str, str]]):
+def _sections_block(doc: Document, sections: List[Dict[str, str]], style: DocxStyleProfile = DEFAULT_STYLE):
     """
     Рендерит список секций.
     Элемент: {"title": str, "text": Optional[str], "level": int, "suppress_empty_dash": bool=False}
@@ -80,10 +205,12 @@ def _sections_block(doc: Document, sections: List[Dict[str, str]]):
             else:
                 if not body:
                     body = "—"
+                
+                body = _normalize_word_breaks(body)
+
                 for chunk in body.split("\n\n"):
                     p = doc.add_paragraph(chunk.strip())
-                    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                    p.paragraph_format.space_after = Pt(0)
+                    _apply_body(p, style)
                 printed_body = True
 
         # Пустую строку добавляем только если реально печатали тело
@@ -128,7 +255,7 @@ def _write_figure_summaries(doc: Document, figure_summaries):
     _heading_h2(doc, "Figure summaries")
     for item in figure_summaries:
         fig = str(item.get("figure") or "").strip()
-        summ = str(item.get("summary") or "").strip()
+        summ = _normalize_word_breaks(str(item.get("summary") or "")).strip()
         if not fig or not summ:
             continue
         p = doc.add_paragraph()
@@ -156,6 +283,7 @@ def append_ai_summary_to_docx(
     *,
     docx_path: Path,
     summary: dict,
+    style: DocxStyleProfile = DEFAULT_STYLE,
 ):
     """
     Добавляет одну версию AI-summary в docx.
@@ -173,14 +301,13 @@ def append_ai_summary_to_docx(
 
     # === HEADER ===
     h1 = doc.add_heading(f'{header.get("year","")} {header.get("title","")}', level=1)
-    h1.paragraph_format.space_before = Pt(0)
-    h1.paragraph_format.space_after = Pt(0)
+    _apply_h1(h1, style)
 
     def meta_line(label, value):
         p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        _apply_meta(p, style)
         r1 = p.add_run(f"{label}: "); r1.bold = True
-        p.add_run(str(value))
+        p.add_run(_normalize_word_breaks(str(value or "")))
 
     meta_line("Source path", header.get("source_path",""))
     meta_line("Model", header.get("model",""))
@@ -223,7 +350,7 @@ def append_ai_summary_to_docx(
         "level": 2,
     })
 
-    _sections_block(doc, sections_out)
+    _sections_block(doc, sections_out, style=style)
 
     # === FIGURES ===
     _write_figure_summaries(doc, summary.get("figures", {}).get("items"))
@@ -234,5 +361,150 @@ def append_ai_summary_to_docx(
         _heading_h2(doc, "Abbreviations")
         pairs = [(a["abbr"], a["expanded"]) for a in abbr]
         _abbrev_simple_table(doc, pairs)
+
+    doc.save(str(docx_path))
+
+    # --- Debug artifact: save the exact summary JSON next to the docx ---
+    # Example: my_summary.docx -> my_summary.summary.json
+    try:
+        json_path = docx_path.with_suffix(".summary.json")
+        json_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        # Do not fail docx saving if JSON dump fails
+        pass
+
+
+# =============================================================================
+# Export extracted article text (NOT AI-summary)
+# =============================================================================
+
+def export_extracted_text_to_docx(
+    *,
+    docx_path,
+    article: dict,
+    source_path: str = "",
+    style: DocxStyleProfile = DEFAULT_STYLE,
+):
+    """
+    Exports extracted article text JSON into a .docx file, using the same
+    formatting conventions as this module.
+
+    Header: standard "year title" + Source path (NO Model / Language).
+    Sections order:
+      Introduction -> Methods -> Results (subsections in JSON order) ->
+      Discussion -> Figures (captions)
+    """
+
+    # Create new doc (overwrite / create)
+    docx_path = Path(str(docx_path))
+    docx_path.parent.mkdir(parents=True, exist_ok=True)
+
+    doc = Document()
+
+    title = str(article.get("title") or "").strip()
+    year = str(article.get("year") or "").strip()
+
+    # === HEADER ===
+    h1 = doc.add_heading(f"{year} {title}".strip(), level=1)
+    _apply_h1(h1, style)
+    
+    def meta_line(label, value):
+        p = doc.add_paragraph()
+        _apply_meta(p, style)
+        r1 = p.add_run(f"{label}: "); r1.bold = True
+        p.add_run(_normalize_word_breaks(str(value or "")))
+
+    if source_path:
+        meta_line("Source path", source_path)
+
+    _blank(doc, 1)
+
+    # === SECTIONS ===
+    def add_section_h2(name: str):
+        _heading_h2(doc, name)
+
+    def add_body(text: str):
+        body = _normalize_word_breaks(str(text or "")).strip()
+        if not body:
+            body = "—"
+        for chunk in body.split("\n\n"):
+            p = doc.add_paragraph(chunk.strip())
+            _apply_body(p, style)
+        _blank(doc, 1)
+
+
+    add_section_h2("Introduction")
+    add_body(str(article.get("introduction") or ""))
+
+    add_section_h2("Methods")
+    add_body(str(article.get("methods") or ""))
+
+    # Results: keep JSON order
+    results = article.get("results") or []
+    add_section_h2(_loc("Results", "EN"))
+    if isinstance(results, list) and results:
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            sec_title = str(item.get("section_title") or "").strip()
+            sec_text = str(item.get("section_text") or "").strip()
+
+            if sec_title:
+                h = doc.add_heading(sec_title, level=3)
+                for r in h.runs:
+                    r.font.size = Pt(12)
+                h.paragraph_format.space_after = Pt(0)
+
+            if sec_text:
+                sec_text = _normalize_word_breaks(sec_text)
+                if sec_text:
+                    sec_text = _normalize_word_breaks(sec_text).strip()
+                    for chunk in sec_text.split("\n\n"):
+                        p = doc.add_paragraph(chunk.strip())
+                        _apply_body(p, style)
+                    _blank(doc, 1)
+
+
+            else:
+                # If there is a title but no text, print dash (consistent with module)
+                if sec_title:
+                    p = doc.add_paragraph("—")
+                    _apply_body(p, style)
+                    _blank(doc, 1)
+
+    else:
+        add_body("")
+
+    add_section_h2("Discussion")
+    add_body(str(article.get("discussion") or ""))
+
+    # Figures
+    figures = article.get("figures") or []
+    add_section_h2("Figures")
+    if isinstance(figures, list) and figures:
+        for fig in figures:
+            if not isinstance(fig, dict):
+                continue
+            num = str(fig.get("figure_number") or "").strip()
+            cap = str(fig.get("figure_caption") or "").strip()
+            if not (num or cap):
+                continue
+
+            p = doc.add_paragraph("—")
+            _apply_body(p, style)
+
+            _apply_figure(p, style)
+
+            if num:
+                r = p.add_run(f"{num}. ")
+                r.bold = True
+            if cap:
+                p.add_run(cap)
+            _blank(doc, 1)
+    else:
+        add_body("")
 
     doc.save(str(docx_path))

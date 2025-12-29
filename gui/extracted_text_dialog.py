@@ -5,11 +5,12 @@ from copy import deepcopy
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 from tkinter import ttk
 from typing import Any, Callable
 
 from gui.file_ops import open_file
+from docx_utils.docx_writer import export_extracted_text_to_docx
 
 
 @dataclass
@@ -96,6 +97,7 @@ class ExtractedTextDialog(tk.Toplevel):
         ttk.Button(actions, text="Extract text again", command=self._on_extract_text_again).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Copy text", command=self._copy_text_from_disk).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Copy JSON", command=self._copy_json_from_disk).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text="Export to docx", command=self._export_to_docx).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Open PDF", command=self._on_open_pdf).pack(side=tk.LEFT)
 
         common = ttk.Frame(root)
@@ -132,6 +134,11 @@ class ExtractedTextDialog(tk.Toplevel):
         self.intro_text = self._text_area(self.tab_intro)
         self.methods_text = self._text_area(self.tab_methods)
         self.discussion_text = self._text_area(self.tab_discussion)
+
+        # Context menu + Ctrl+M
+        self._install_text_context_menu(self.intro_text)
+        self._install_text_context_menu(self.methods_text)
+        self._install_text_context_menu(self.discussion_text)
 
         # Results: scrollable
         self.results_canvas, self.results_inner = self._make_scrollable_tab(self.tab_results)
@@ -170,6 +177,77 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self._setup_paragraph_spacing(txt)
         return txt
+    
+        # ---------------- Context menu: text helpers ----------------
+
+    def _install_text_context_menu(self, txt: tk.Text) -> None:
+        """
+        Adds right-click context menu to a tk.Text:
+        - Remove new lines (in selection)
+        Also binds Ctrl+M to the same action when this Text is focused.
+        """
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="Remove new lines",
+            command=lambda w=txt: self._remove_newlines_in_selection(w),
+        )
+
+        def _popup(event: tk.Event) -> str:
+            # Show menu only for Text widgets
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                try:
+                    menu.grab_release()
+                except Exception:
+                    pass
+            return "break"
+
+        # Right-click (Windows/Linux)
+        txt.bind("<Button-3>", _popup, add=True)
+
+        # macOS sometimes uses Button-2; harmless elsewhere
+        txt.bind("<Button-2>", _popup, add=True)
+
+        # Ctrl+M on this widget
+        txt.bind("<Control-m>", lambda _e, w=txt: self._remove_newlines_in_selection(w), add=True)
+        txt.bind("<Control-M>", lambda _e, w=txt: self._remove_newlines_in_selection(w), add=True)
+
+    def _remove_newlines_in_selection(self, txt: tk.Text) -> str:
+        """
+        Remove all newline characters in the selected text fragment of the given Text widget.
+        Replaces '\\n' with a single space to avoid accidental word concatenation.
+        """
+        try:
+            start = txt.index("sel.first")
+            end = txt.index("sel.last")
+        except tk.TclError:
+            # No selection
+            return "break"
+
+        selected = txt.get(start, end)
+        if not selected:
+            return "break"
+
+        replaced = selected.replace("\n", " ")
+        if replaced == selected:
+            return "break"
+
+        # Replace selection
+        txt.delete(start, end)
+        txt.insert(start, replaced)
+
+        # Restore selection over the replaced text
+        try:
+            new_end = f"{start}+{len(replaced)}c"
+            txt.tag_add("sel", start, new_end)
+            txt.mark_set(tk.INSERT, new_end)
+            txt.see(tk.INSERT)
+        except Exception:
+            pass
+
+        return "break"
+
 
     def _make_scrollable_tab(self, parent: ttk.Frame) -> tuple[tk.Canvas, ttk.Frame]:
         parent.columnconfigure(0, weight=1)
@@ -225,13 +303,28 @@ class ExtractedTextDialog(tk.Toplevel):
         self._mousewheel_routing_installed = True
 
         def _on_wheel(event: tk.Event) -> str | None:
-            # Identify widget under pointer reliably
-            w = self.winfo_containing(event.x_root, event.y_root)
+            # When file dialogs or other toplevels are open, bind_all() still receives events.
+            # In that case winfo_containing() may point to '__tk_filedialog' and raise KeyError.
+            try:
+                w = self.winfo_containing(event.x_root, event.y_root)
+            except (KeyError, tk.TclError):
+                return None
+
+            if w is None:
+                return None
+
+            # Ignore wheel events coming from other Toplevel windows (e.g., __tk_filedialog)
+            try:
+                if w.winfo_toplevel() is not self:
+                    return None
+            except tk.TclError:
+                return None
+
             if isinstance(w, tk.Text):
                 # Linux wheel buttons
-                if event.num == 4:
+                if getattr(event, "num", None) == 4:
                     w.yview_scroll(-1, "units")
-                elif event.num == 5:
+                elif getattr(event, "num", None) == 5:
                     w.yview_scroll(1, "units")
                 else:
                     delta = getattr(event, "delta", 0)
@@ -241,23 +334,27 @@ class ExtractedTextDialog(tk.Toplevel):
 
             # Prefer scrolling the tab-level canvas when not over Text
             target_canvas: tk.Canvas | None = None
-            if hasattr(self, "results_canvas") and self._is_descendant(w, self.results_canvas):
-                target_canvas = self.results_canvas
-            elif hasattr(self, "figures_canvas") and self._is_descendant(w, self.figures_canvas):
-                target_canvas = self.figures_canvas
+            try:
+                if hasattr(self, "results_canvas") and self._is_descendant(w, self.results_canvas):
+                    target_canvas = self.results_canvas
+                elif hasattr(self, "figures_canvas") and self._is_descendant(w, self.figures_canvas):
+                    target_canvas = self.figures_canvas
+            except Exception:
+                target_canvas = None
 
             if target_canvas is None:
                 return None
 
-            if event.num == 4:
+            if getattr(event, "num", None) == 4:
                 target_canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
+            elif getattr(event, "num", None) == 5:
                 target_canvas.yview_scroll(1, "units")
             else:
                 delta = getattr(event, "delta", 0)
                 if delta:
                     target_canvas.yview_scroll(int(-delta / 120), "units")
             return "break"
+
 
         # Linux: Button-4/5. Windows/macOS: MouseWheel.
         self.bind_all("<Button-4>", _on_wheel)
@@ -488,7 +585,6 @@ class ExtractedTextDialog(tk.Toplevel):
 
 # ---------------- Dynamic blocks: Results ----------------
 
-    
     def _add_result_section(
         self,
         section_title: str = "",
@@ -542,6 +638,7 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self._set_text(txt, section_text)
         self._setup_paragraph_spacing(txt)
+        self._install_text_context_menu(txt)
 
         w = _ResultSectionWidgets(frame=frame, title_var=title_var, title_entry=title_entry, text=txt)
 
@@ -648,6 +745,7 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self._set_text(cap, caption)
         self._setup_figure_caption_behavior(cap)
+        self._install_text_context_menu(cap)
 
         w = _FigureWidgets(frame=frame, number_var=num_var, number_entry=num_entry, caption=cap)
         self._figure_widgets.insert(list_index, w)
@@ -747,6 +845,43 @@ class ExtractedTextDialog(tk.Toplevel):
         self.clipboard_append(txt)
         messagebox.showinfo("Copy JSON", "Saved JSON has been copied to clipboard.")
 
+    def _export_to_docx(self) -> None:
+        # Load JSON from disk (as requested)
+        try:
+            raw = self.json_path.read_text(encoding="utf-8")
+            obj = json.loads(raw)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read JSON:\n{e}")
+            return
+
+        # Ask save path
+        default_name = (str(obj.get("title") or "article").strip() or "article")
+        # keep filename safe-ish
+        default_name = "".join(ch if ch.isalnum() or ch in " _-." else "_" for ch in default_name)[:80]
+
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export to docx",
+            defaultextension=".docx",
+            initialfile=f"{default_name}.docx",
+            filetypes=[("Word document", "*.docx")],
+        )
+        if not path:
+            return
+
+        try:
+            export_extracted_text_to_docx(
+                docx_path=Path(path),
+                article=obj,
+                source_path=str(self.pdf_path or self.json_path),
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export docx:\n{e}")
+            return
+
+        messagebox.showinfo("Export to docx", "DOCX exported successfully.")
+
+
     def _copy_text_from_disk(self) -> None:
         if not self.json_path.exists():
             messagebox.showerror("Copy text", f"JSON not found:\n{self.json_path}")
@@ -773,7 +908,6 @@ class ExtractedTextDialog(tk.Toplevel):
 
         add_block("Introduction", str(obj.get("introduction", "") or ""))
         add_block("Methods", str(obj.get("methods", "") or ""))
-        add_block("Discussion", str(obj.get("discussion", "") or ""))
 
         results = obj.get("results") or []
         if isinstance(results, list) and results:
@@ -788,6 +922,8 @@ class ExtractedTextDialog(tk.Toplevel):
                         parts.append(f"\n{sub}\n{txt}".rstrip())
                     else:
                         parts.append(f"\n{txt}".rstrip())
+
+        add_block("Discussion", str(obj.get("discussion", "") or ""))
 
         figures = obj.get("figures") or []
         if isinstance(figures, list) and figures:
