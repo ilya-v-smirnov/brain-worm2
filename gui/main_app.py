@@ -17,6 +17,5 @@ def main() -> None:
         return
     root.mainloop()
 
-
 if __name__ == "__main__":
     main()

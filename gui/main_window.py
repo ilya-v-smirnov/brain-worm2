@@ -16,6 +16,7 @@ from gui.rename_new_pdfs_dialog import RenameNewPdfsDialog
 from gui.summary_generation_dialog import SummaryGenerationDialog
 from ai_summary.generator import generate_summary
 from docx_utils.docx_writer import append_ai_summary_to_docx
+from gui.semi_manual_summary_dialog import SemiManualSummaryDialog
 
 
 CHECK = "✓"
@@ -188,6 +189,51 @@ class MainWindow:
     def _on_rename_new(self) -> None:
         RenameNewPdfsDialog(self.master)
 
+    def _ask_summary_mode(self) -> str | None:
+        """
+        Returns:
+        "auto"  - automated generation
+        "semi"  - semi-manual generation
+        None    - cancel
+        """
+        win = tk.Toplevel(self.master)
+        win.title("Summary Generation")
+        win.resizable(False, False)
+        win.transient(self.master)
+        win.grab_set()
+
+        result: dict[str, str | None] = {"mode": None}
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="Choose summary generation mode:").pack(anchor="w")
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill=tk.X, pady=(10, 0))
+
+        def choose(mode: str | None) -> None:
+            result["mode"] = mode
+            win.destroy()
+
+        ttk.Button(btns, text="Automated generation", command=lambda: choose("auto")).pack(fill=tk.X)
+        ttk.Button(btns, text="Semi-Manual generation", command=lambda: choose("semi")).pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btns, text="Cancel", command=lambda: choose(None)).pack(fill=tk.X, pady=(6, 0))
+
+        win.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+
+        # center-ish
+        try:
+            win.update_idletasks()
+            x = self.master.winfo_rootx() + 80
+            y = self.master.winfo_rooty() + 80
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        self.master.wait_window(win)
+        return result["mode"]
+
     def _on_generate(self, kind: str) -> None:
         payload = self._get_selected_payload()
         if not payload or payload.get("type") != "pdf":
@@ -197,11 +243,42 @@ class MainWindow:
         if kind != "summary":
             messagebox.showinfo("Generate", "Not implemented yet")
             return
-
-        dlg = SummaryGenerationDialog(self.master, default_model="ChatGPT-5.2", default_language="EN")
-        opts = dlg.show()
-        if opts is None:
+        
+        mode = self._ask_summary_mode()
+        if mode is None:
             return
+        
+        if mode == "semi":
+            article_id = int(payload["article_id"])
+
+            json_rel = self.db.fetch_json_path_for_article(article_id)
+            if not json_rel:
+                messagebox.showwarning("Semi-Manual Summary", "No extracted JSON for this article yet.")
+                return
+            json_path = Path(self.db.resolve_path(json_rel))
+
+            pdf_rel = payload.get("pdf_path")
+            if not pdf_rel:
+                messagebox.showerror("Semi-Manual Summary", "Internal error: PDF path not found in DB payload.")
+                return
+            pdf_path = Path(self.db.resolve_path(pdf_rel))
+
+            SemiManualSummaryDialog(
+                self.master,
+                json_path=json_path,
+                pdf_path=pdf_path,
+                parse_pdf_func=None,
+                db_gateway=self.db,
+                article_id=article_id,
+                existing_summary_path=payload.get("summary_path"),
+            )
+            return
+
+        if mode == "auto":
+            dlg = SummaryGenerationDialog(self.master, default_model="ChatGPT-5.2", default_language="EN")
+            opts = dlg.show()
+            if opts is None:
+                return
 
         article_id = int(payload["article_id"])
         pdf_path_rel = payload.get("pdf_path")  # то, что в БД (обычно относительное)

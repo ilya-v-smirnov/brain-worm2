@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
@@ -508,3 +509,176 @@ def export_extracted_text_to_docx(
         add_body("")
 
     doc.save(str(docx_path))
+
+
+def _parse_bullets(text: str) -> list[str]:
+    """
+    Превращает текст из textbox в список буллетов.
+    Поддерживает строки вида:
+      - item
+      • item
+      * item
+      1) item
+      1. item
+    Если маркеров нет — режет по непустым строкам.
+    """
+    if not text:
+        return []
+    lines = [ln.strip() for ln in str(text).splitlines()]
+    lines = [ln for ln in lines if ln]
+
+    out: list[str] = []
+    for ln in lines:
+        ln = ln.strip()
+        ln = re.sub(r"^[-•*]\s+", "", ln)
+        ln = re.sub(r"^\d+\s*[\.\)]\s+", "", ln)
+        out.append(ln.strip())
+
+    # Если всё превратилось в пустоту — вернём пустой
+    out = [x for x in out if x]
+    return out
+
+
+def append_semi_manual_summary_to_docx(
+    *,
+    docx_path: Path,
+    payload: dict,
+    style: DocxStyleProfile = DEFAULT_STYLE,
+    overwrite: bool = False,
+) -> None:
+    """
+    Сохраняет semi-manual summary в .docx.
+    - overwrite=True: перезаписать файл
+    - overwrite=False: если файл существует -> добавляет page break и дописывает новую версию
+    Ожидаемый payload (минимум):
+      {
+        "title": str,
+        "year": str|int,
+        "language": "EN"|"RU"|...,
+        "summary": {
+            "key_points": str,
+            "introduction": str,
+            "methods": str,
+            "results": [{"section_title": str, "summary_text": str}, ...],
+            "discussion": str,
+            "figure_narrative": str,
+        },
+        "prompts_used": {... optional ...},
+        "source_json": str,
+        "source_pdf": str,
+      }
+    """
+    docx_path = Path(str(docx_path))
+    docx_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if overwrite and docx_path.exists():
+        try:
+            docx_path.unlink()
+        except Exception:
+            # если не смогли удалить — попробуем всё равно открыть как Document и перезаписать
+            pass
+
+    if docx_path.exists():
+        doc = Document(str(docx_path))
+        _add_page_break_if_needed(doc)
+    else:
+        doc = Document()
+
+    title = str(payload.get("title") or "").strip()
+    year = str(payload.get("year") or "").strip()
+    lang = str(payload.get("language") or "").strip()
+
+    # === HEADER ===
+    h1 = doc.add_heading(f"{year} {title}".strip(), level=1)
+    _apply_h1(h1, style)
+
+    def meta_line(label: str, value: str) -> None:
+        p = doc.add_paragraph()
+        _apply_meta(p, style)
+        r1 = p.add_run(f"{label}: ")
+        r1.bold = True
+        p.add_run(_normalize_word_breaks(str(value or "")))
+
+    if payload.get("source_json"):
+        meta_line("Source JSON", str(payload.get("source_json") or ""))
+    if payload.get("source_pdf"):
+        meta_line("Source PDF", str(payload.get("source_pdf") or ""))
+    if lang:
+        meta_line("Language", lang)
+
+    _blank(doc, 1)
+
+    summary = payload.get("summary") or {}
+
+    # === KEY POINTS ===
+    _heading_h2(doc, "Key points")
+    kp_items = _parse_bullets(str(summary.get("key_points") or ""))
+    if kp_items:
+        _bullet_list(doc, kp_items)
+    else:
+        p = doc.add_paragraph("—")
+        _apply_body(p, style)
+    _blank(doc, 1)
+
+    # === SECTIONS ===
+    def add_h2(name: str) -> None:
+        _heading_h2(doc, name)
+
+    def add_body(text: str) -> None:
+        body = _normalize_word_breaks(str(text or "")).strip()
+        if not body:
+            body = "—"
+        for chunk in body.split("\n\n"):
+            p = doc.add_paragraph(chunk.strip())
+            _apply_body(p, style)
+        _blank(doc, 1)
+
+    add_h2("Introduction")
+    add_body(str(summary.get("introduction") or ""))
+
+    add_h2("Methods")
+    add_body(str(summary.get("methods") or ""))
+
+    # Results (subsections)
+    add_h2("Results")
+    results = summary.get("results") or []
+    if isinstance(results, list) and results:
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            sec_title = str(item.get("section_title") or "").strip()
+            sec_text = str(item.get("summary_text") or "").strip()
+
+            if sec_title:
+                h = doc.add_heading(sec_title, level=3)
+                for r in h.runs:
+                    r.font.size = Pt(12)
+                h.paragraph_format.space_after = Pt(0)
+
+            if sec_text:
+                sec_text = _normalize_word_breaks(sec_text).strip()
+                for chunk in sec_text.split("\n\n"):
+                    p = doc.add_paragraph(chunk.strip())
+                    _apply_body(p, style)
+                _blank(doc, 1)
+            else:
+                p = doc.add_paragraph("—")
+                _apply_body(p, style)
+                _blank(doc, 1)
+    else:
+        add_body("")
+
+    add_h2("Discussion")
+    add_body(str(summary.get("discussion") or ""))
+
+    add_h2("Figure narrative")
+    add_body(str(summary.get("figure_narrative") or ""))
+
+    doc.save(str(docx_path))
+
+    # Debug artifact рядом: сохраним payload, чтобы можно было восстановить состояние
+    try:
+        json_path = docx_path.with_suffix(".semi_manual.summary.json")
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass

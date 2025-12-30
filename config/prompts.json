@@ -1,0 +1,8 @@
+{
+  "introduction": { "template": "Write a concise summary in {LANG} of the Introduction. Focus on background, gap, and objective." },
+  "methods": { "template": "Summarize in {LANG} the Methods focusing on experimental design, key materials, and core procedures." },
+  "results": { "template": "Summarize in {LANG} this Results subsection: key findings, comparisons, and reported metrics. No speculation." },
+  "discussion": { "template": "Summarize in {LANG} the Discussion: interpretation, implications, limitations, and main conclusion." },
+  "key_points": { "template": "In {LANG}, produce 5–8 key bullet points capturing the paper’s main contributions and outcomes." },
+  "figure_narrative": { "template": "In {LANG}, create a coherent narrative of the figures: what each figure shows and the overall story." }
+}
