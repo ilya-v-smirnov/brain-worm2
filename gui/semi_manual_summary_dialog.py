@@ -221,9 +221,14 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.geometry("1150x800")
 
         # Modal behavior: block Main Window interaction while this dialog is open
-        self.transient(master)
-        self.grab_set()
+        # NOTE: Do NOT use transient(master) here — many Linux window managers treat
+        # transient windows as dialogs and disable Maximize.
+        self.resizable(True, True)
         self.lift()
+
+        # Make modal only after the window becomes visible (WM then handles maximize normally)
+        self.after(0, self._make_modal)
+
         try:
             self.focus_force()
         except Exception:
@@ -587,6 +592,23 @@ class SemiManualSummaryDialog(tk.Toplevel):
         pr_block.grid(row=2, column=0, columnspan=2, sticky="ew")
         self.fignarr_prompt   = _make_text(pr_block, height=7, readonly=False)
 
+    def _make_modal(self) -> None:
+        # Ensure window is actually mapped before grabbing input
+        try:
+            self.wait_visibility()
+        except Exception:
+            pass
+
+        try:
+            self.grab_set()
+        except Exception:
+            pass
+
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+
     # ---------------- Load data ----------------
 
     def _load(self) -> None:
@@ -653,6 +675,22 @@ class SemiManualSummaryDialog(tk.Toplevel):
         # init counters + bind live updates
         self._refresh_all_word_counters()
         self._bind_word_counter_updates()
+        # Ctrl+A / Ctrl+Ф for all prompt fields
+        prompt_fields = [
+            self.intro_prompt,
+            self.methods_prompt,
+            self.results_prompt,
+            self.disc_prompt,
+            self.kp_prompt,
+            self.fignarr_prompt,
+        ]
+
+        for p in prompt_fields:
+            try:
+                self._bind_select_all_shortcuts(p)
+            except Exception:
+                pass
+
 
     def _apply_language_to_prompts(self) -> None:
         lang_code = self.lang_var.get().strip() or "EN"

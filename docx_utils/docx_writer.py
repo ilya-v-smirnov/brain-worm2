@@ -91,6 +91,58 @@ def _apply_figure(p, style: DocxStyleProfile) -> None:
     )
 
 
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _add_runs_with_bold_markdown(p, text: str) -> None:
+    """
+    Adds runs to an existing paragraph, converting **bold** to bold runs.
+    Minimal parser: no nesting, no escaping.
+    """
+    s = str(text or "")
+    pos = 0
+    for m in _MD_BOLD_RE.finditer(s):
+        if m.start() > pos:
+            p.add_run(s[pos:m.start()])
+        r = p.add_run(m.group(1))
+        r.bold = True
+        pos = m.end()
+    if pos < len(s):
+        p.add_run(s[pos:])
+
+
+def _add_markdown_body(doc: Document, text: str, style: DocxStyleProfile) -> None:
+    """
+    Renders body text with minimal markdown support:
+      - **bold** -> bold runs
+      - lines starting with '* ' -> bullet points
+    Paragraph boundaries are taken from _normalize_word_breaks() -> split by blank lines.
+    """
+    body = _normalize_word_breaks(str(text or "")).strip()
+    if not body:
+        body = "—"
+
+    for chunk in body.split("\n\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+
+        # A chunk may still contain multiple lines (rare). Handle line-by-line.
+        lines = chunk.splitlines() or [chunk]
+        for ln in lines:
+            ln = ln.rstrip()
+
+            if ln.lstrip().startswith("* "):
+                bullet_text = ln.lstrip()[2:].strip()
+                p = doc.add_paragraph(style="List Bullet")
+                _apply_body(p, style)
+                _add_runs_with_bold_markdown(p, bullet_text)
+            else:
+                p = doc.add_paragraph()
+                _apply_body(p, style)
+                _add_runs_with_bold_markdown(p, ln.strip())
+
+
 # --- Базовые помощники -------------------------------------------------------
 
 def _normalize_word_breaks(text: str) -> str:
@@ -599,10 +651,8 @@ def append_semi_manual_summary_to_docx(
         r1.bold = True
         p.add_run(_normalize_word_breaks(str(value or "")))
 
-    if payload.get("source_json"):
-        meta_line("Source JSON", str(payload.get("source_json") or ""))
     if payload.get("source_pdf"):
-        meta_line("Source PDF", str(payload.get("source_pdf") or ""))
+        meta_line("Source", str(payload.get("source_pdf") or ""))
     if lang:
         meta_line("Language", lang)
 
@@ -625,12 +675,7 @@ def append_semi_manual_summary_to_docx(
         _heading_h2(doc, name)
 
     def add_body(text: str) -> None:
-        body = _normalize_word_breaks(str(text or "")).strip()
-        if not body:
-            body = "—"
-        for chunk in body.split("\n\n"):
-            p = doc.add_paragraph(chunk.strip())
-            _apply_body(p, style)
+        _add_markdown_body(doc, text, style)
         _blank(doc, 1)
 
     add_h2("Introduction")
