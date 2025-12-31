@@ -1,8 +1,20 @@
 {
-  "introduction": { "template": "Write a concise summary in {LANG} of the Introduction. Focus on background, gap, and objective." },
-  "methods": { "template": "Summarize in {LANG} the Methods focusing on experimental design, key materials, and core procedures." },
-  "results": { "template": "Summarize in {LANG} this Results subsection: key findings, comparisons, and reported metrics. No speculation." },
-  "discussion": { "template": "Summarize in {LANG} the Discussion: interpretation, implications, limitations, and main conclusion." },
-  "key_points": { "template": "In {LANG}, produce 5–8 key bullet points capturing the paper’s main contributions and outcomes." },
-  "figure_narrative": { "template": "In {LANG}, create a coherent narrative of the figures: what each figure shows and the overall story." }
+  "introduction": {
+    "template": "Write a concise summary in {LANG} of the Introduction. Focus on background, gap, objective, and approach. Give me a structured piece of text ready to copy. Do not add comments to your response."
+  },
+  "methods": {
+    "template": "Summarize in {LANG} the Methods focusing on experimental design, core procedures, and recombinant costructs used in the study. Give me a short structured piece of text ready to copy. Do not add comments to your response."
+  },
+  "results": {
+    "template": "Summarize in {LANG} this Results subsection of a scientific article: key findings, comparisons, and reported metrics. No speculation, just authors' interpretations. Give me a piece of text without internal sections ready to copy. Do not add comments to your response. IMPORTANT: keep all figure and table references (excluding supplementary figures/tables) in your response."
+  },
+  "discussion": {
+    "template": "Summarize in {LANG} the Discussion: interpretation, implications, limitations, and main conclusions. Give me a short structured piece of text ready to copy. Do not add comments to your response."
+  },
+  "key_points": {
+    "template": "In {LANG}, produce 3–8 key bullet points capturing the paper’s main contributions and outcomes.  No speculation, just authors' interpretations. Give me a short structured piece of text ready to copy. Do not add comments to your response."
+  },
+  "figure_narrative": {
+    "template": "In {LANG}, create a coherent narrative of the figures: what each figure shows and the overall story. IMPORTANT: keep all figure references. Give me a short structured piece of text ready to copy. Do not add comments to your response."
+  }
 }

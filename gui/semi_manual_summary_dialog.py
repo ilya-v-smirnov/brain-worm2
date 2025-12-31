@@ -156,6 +156,33 @@ def _clipboard_set(window: tk.Toplevel, text: str) -> None:
     window.clipboard_append(text)
 
 
+def _resolve_existing_docx_path(db_gateway, rel_or_abs: str) -> Path:
+        p = Path(rel_or_abs)
+        if p.is_absolute():
+            return p
+        # если есть gateway — он знает project_home
+        if db_gateway is not None:
+            return Path(db_gateway.resolve_path(rel_or_abs))
+        return p.resolve()
+
+
+_WORD_RE = re.compile(r"\b\w+\b", flags=re.UNICODE)
+
+def _word_count(text: str) -> int:
+    if not text:
+        return 0
+    return len(_WORD_RE.findall(text))
+
+
+def _set_green_border(txt: tk.Text, enabled: bool, *, thickness: int = 3) -> None:
+    # Use the Text highlight border (works cross-platform)
+    if enabled:
+        txt.configure(highlightthickness=thickness, highlightbackground="green", highlightcolor="green")
+    else:
+        # Restore to a neutral default; avoid guessing system color too hard
+        txt.configure(highlightthickness=1, highlightbackground="#d9d9d9", highlightcolor="#d9d9d9")
+
+
 @dataclass
 class _ResultRow:
     frame: ttk.Frame
@@ -163,6 +190,8 @@ class _ResultRow:
     extracted_text: tk.Text
     summary_text: tk.Text
     copy_btn: ttk.Button
+    extracted_words_lbl: ttk.Label
+    summary_words_lbl: ttk.Label
 
 
 class SemiManualSummaryDialog(tk.Toplevel):
@@ -191,8 +220,14 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.title("Semi-Manual Summary Generation")
         self.geometry("1150x800")
 
+        # Modal behavior: block Main Window interaction while this dialog is open
+        self.transient(master)
         self.grab_set()
         self.lift()
+        try:
+            self.focus_force()
+        except Exception:
+            pass
 
         self.json_path = json_path
         self.pdf_path = pdf_path
@@ -226,14 +261,20 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.intro_extracted: tk.Text
         self.intro_summary: tk.Text
         self.intro_prompt: tk.Text
+        self.intro_ex_words: ttk.Label
+        self.intro_sum_words: ttk.Label
 
         self.methods_extracted: tk.Text
         self.methods_summary: tk.Text
         self.methods_prompt: tk.Text
+        self.methods_ex_words: ttk.Label
+        self.methods_sum_words: ttk.Label
 
         self.disc_extracted: tk.Text
         self.disc_summary: tk.Text
         self.disc_prompt: tk.Text
+        self.disc_ex_words: ttk.Label
+        self.disc_sum_words: ttk.Label
 
         self.kp_summary: tk.Text
         self.kp_prompt: tk.Text
@@ -241,6 +282,10 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.figcap_extracted: tk.Text
         self.fignarr_summary: tk.Text
         self.fignarr_prompt: tk.Text
+        self.fig_ex_words: ttk.Label
+        self.fignarr_sum_words: ttk.Label
+
+        self._last_copied_text: tk.Text | None = None
 
         # results
         self.results_canvas: tk.Canvas
@@ -381,19 +426,24 @@ class SemiManualSummaryDialog(tk.Toplevel):
         ex_block.rowconfigure(1, weight=1)
         ex_block.columnconfigure(0, weight=1)
         extracted = _make_text(ex_block, height=10, readonly=True)
+        # Words counters (bottom-right under each text box)
+        ex_words = ttk.Label(ex_block, text="Words: 0")
+        ex_words.grid(row=2, column=0, sticky="e", pady=(4, 0))
 
         sum_block = _make_labeled_block(tab, "Summary")
         sum_block.grid(row=0, column=1, sticky="nsew")
         sum_block.rowconfigure(1, weight=1)
         sum_block.columnconfigure(0, weight=1)
         summary   = _make_text(sum_block, height=10, readonly=False)
+        sum_words = ttk.Label(sum_block, text="Words: 0, 0%")
+        sum_words.grid(row=2, column=0, sticky="e", pady=(4, 0))
 
         # Row 1: Copy
         btn_row = ttk.Frame(tab)
         btn_row.grid(row=1, column=0, sticky="w", pady=(8, 10))
         ttk.Button(
             btn_row,
-            text="Copy (prompt + extracted)",
+            text="Copy",
             command=lambda k=prompt_key, ex=extracted: self._copy_prompt_plus_extracted(k, ex),
         ).pack(anchor="w")
 
@@ -402,6 +452,17 @@ class SemiManualSummaryDialog(tk.Toplevel):
         pr_block.grid(row=2, column=0, columnspan=2, sticky="ew")
         # prompt should not steal vertical space; height set to 7
         prompt    = _make_text(pr_block, height=7, readonly=False)
+
+        # Store word labels on the instance
+        if out_widgets[0] == "intro_extracted":
+            self.intro_ex_words = ex_words
+            self.intro_sum_words = sum_words
+        elif out_widgets[0] == "methods_extracted":
+            self.methods_ex_words = ex_words
+            self.methods_sum_words = sum_words
+        elif out_widgets[0] == "disc_extracted":
+            self.disc_ex_words = ex_words
+            self.disc_sum_words = sum_words
 
         setattr(self, out_widgets[0], extracted)
         setattr(self, out_widgets[1], summary)
@@ -430,8 +491,8 @@ class SemiManualSummaryDialog(tk.Toplevel):
         btn_row.grid(row=1, column=0, sticky="w", pady=(8, 10))
         ttk.Button(
             btn_row,
-            text="Copy (prompt + summary)",
-            command=self._copy_keypoints_prompt_plus_summary,
+            text="Copy",
+            command=self._copy_keypoints_prompt_plus_sources,
         ).pack(anchor="w")
 
         pr_block = _make_labeled_block(tab, "Prompt")
@@ -503,19 +564,23 @@ class SemiManualSummaryDialog(tk.Toplevel):
         ex_block.rowconfigure(1, weight=1)
         ex_block.columnconfigure(0, weight=1)
         self.figcap_extracted = _make_text(ex_block, height=10, readonly=True)
+        self.fig_ex_words = ttk.Label(ex_block, text="Words: 0")
+        self.fig_ex_words.grid(row=2, column=0, sticky="e", pady=(4, 0))
 
         sum_block = _make_labeled_block(tab, "Summary")
         sum_block.grid(row=0, column=1, sticky="nsew")
         sum_block.rowconfigure(1, weight=1)
         sum_block.columnconfigure(0, weight=1)
         self.fignarr_summary  = _make_text(sum_block, height=10, readonly=False)
+        self.fignarr_sum_words = ttk.Label(sum_block, text="Words: 0, 0%")
+        self.fignarr_sum_words.grid(row=2, column=0, sticky="e", pady=(4, 0))
 
         btn_row = ttk.Frame(tab)
         btn_row.grid(row=1, column=0, sticky="w", pady=(8, 10))
         ttk.Button(
             btn_row,
-            text="Copy (prompt + extracted captions)",
-            command=lambda: self._copy_prompt_plus_extracted("figure_narrative", self.figcap_extracted),
+            text="Copy",
+            command=self._copy_figure_narrative_prompt_plus_sources,
         ).pack(anchor="w")
 
         pr_block = _make_labeled_block(tab, "Prompt")
@@ -585,6 +650,10 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.results_canvas.update_idletasks()
         self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
 
+        # init counters + bind live updates
+        self._refresh_all_word_counters()
+        self._bind_word_counter_updates()
+
     def _apply_language_to_prompts(self) -> None:
         lang_code = self.lang_var.get().strip() or "EN"
         lang_word = self.LANG_MAP.get(lang_code, "English")
@@ -624,16 +693,20 @@ class SemiManualSummaryDialog(tk.Toplevel):
         ex_block.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         extracted_txt = _make_text(ex_block, height=8, readonly=True)
         _set_text(extracted_txt, extracted, readonly=True)
+        ex_words = ttk.Label(ex_block, text="Words: 0")
+        ex_words.grid(row=2, column=0, sticky="e", pady=(4, 0))
 
         sum_block = _make_labeled_block(grid, "Summary")
         sum_block.grid(row=0, column=1, sticky="nsew")
         summary_txt = _make_text(sum_block, height=8, readonly=False)
+        sum_words = ttk.Label(sum_block, text="Words: 0, 0%")
+        sum_words.grid(row=2, column=0, sticky="e", pady=(4, 0))
 
         btn_row = ttk.Frame(f)
         btn_row.pack(fill=tk.X, pady=(6, 0))
         copy_btn = ttk.Button(
             btn_row,
-            text="Copy (results prompt + extracted)",
+            text="Copy",
             command=lambda ex=extracted_txt: self._copy_results_prompt_plus_extracted(ex),
         )
         copy_btn.pack(anchor="w")
@@ -645,17 +718,10 @@ class SemiManualSummaryDialog(tk.Toplevel):
                 extracted_text=extracted_txt,
                 summary_text=summary_txt,
                 copy_btn=copy_btn,
+                extracted_words_lbl=ex_words,
+                summary_words_lbl=sum_words,
             )
         )
-
-    def _resolve_existing_docx_path(db_gateway, rel_or_abs: str) -> Path:
-        p = Path(rel_or_abs)
-        if p.is_absolute():
-            return p
-        # если есть gateway — он знает project_home
-        if db_gateway is not None:
-            return Path(db_gateway.resolve_path(rel_or_abs))
-        return p.resolve()
 
 
     # ---------------- Mouse wheel routing ----------------
@@ -721,6 +787,151 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.bind_all("<Button-5>", _on_wheel)
         self.bind_all("<MouseWheel>", _on_wheel)
 
+    def _collect_results_summaries_text(self) -> str:
+        parts: list[str] = []
+        for r in self._result_rows:
+            s = _get_text(r.summary_text).strip()
+            if s:
+                parts.append(s)
+        return "\n\n".join(parts).strip()
+
+    def _copy_keypoints_prompt_plus_sources(self) -> None:
+        # Copy sources: all Results/Summary + Discussion/Summary
+        prompt = _get_text(self.kp_prompt).strip()
+        src_parts: list[str] = []
+
+        res = self._collect_results_summaries_text()
+        if res:
+            src_parts.append(res)
+
+        disc = _get_text(self.disc_summary).strip()
+        if disc:
+            src_parts.append(disc)
+
+        src = "\n\n".join(src_parts).strip()
+        payload = (prompt + "\n\n" + src).strip() + "\n"
+        _clipboard_set(self, payload)
+
+    def _copy_figure_narrative_prompt_plus_sources(self) -> None:
+        # Copy sources: all Results/Summary + Figure narrative/Extracted
+        prompt = _get_text(self.fignarr_prompt).strip()
+        src_parts: list[str] = []
+
+        res = self._collect_results_summaries_text()
+        if res:
+            src_parts.append(res)
+
+        fig_ex = _get_text(self.figcap_extracted).strip()
+        if fig_ex:
+            src_parts.append(fig_ex)
+
+        src = "\n\n".join(src_parts).strip()
+        payload = (prompt + "\n\n" + src).strip() + "\n"
+        _clipboard_set(self, payload)
+        self._mark_last_copied(self.figcap_extracted)
+        self._refresh_all_word_counters()
+
+    def _update_pair_counters(
+        self,
+        extracted: tk.Text,
+        summary: tk.Text,
+        extracted_lbl: ttk.Label,
+        summary_lbl: ttk.Label,
+    ) -> None:
+        ex_w = _word_count(_get_text(extracted).strip())
+        sum_w = _word_count(_get_text(summary).strip())
+        pct = int(round((sum_w / ex_w) * 100)) if ex_w > 0 else 0
+
+        extracted_lbl.configure(text=f"Words: {ex_w}")
+        summary_lbl.configure(text=f"Words: {sum_w}, {pct}%")
+
+    def _refresh_all_word_counters(self) -> None:
+        # Intro/Methods/Discussion
+        self._update_pair_counters(self.intro_extracted, self.intro_summary, self.intro_ex_words, self.intro_sum_words)
+        self._update_pair_counters(self.methods_extracted, self.methods_summary, self.methods_ex_words, self.methods_sum_words)
+        self._update_pair_counters(self.disc_extracted, self.disc_summary, self.disc_ex_words, self.disc_sum_words)
+
+        # Figure narrative (Extracted captions vs narrative summary)
+        self._update_pair_counters(self.figcap_extracted, self.fignarr_summary, self.fig_ex_words, self.fignarr_sum_words)
+
+        # Results rows
+        for r in self._result_rows:
+            self._update_pair_counters(r.extracted_text, r.summary_text, r.extracted_words_lbl, r.summary_words_lbl)
+
+    def _bind_word_counter_updates(self) -> None:
+        # Track changes in editable Summary fields
+        def bind_text(t: tk.Text) -> None:
+            t.bind("<<Modified>>", self._on_any_text_modified)
+            self._bind_select_all_shortcuts(t)
+
+        bind_text(self.intro_summary)
+        bind_text(self.methods_summary)
+        bind_text(self.disc_summary)
+        bind_text(self.fignarr_summary)
+        bind_text(self.kp_summary)
+
+        for r in self._result_rows:
+            bind_text(r.summary_text)
+
+    def _on_any_text_modified(self, event: tk.Event) -> None:
+        w = event.widget
+        if isinstance(w, tk.Text):
+            # reset modified flag to keep event firing
+            try:
+                w.edit_modified(False)
+            except Exception:
+                pass
+        self._refresh_all_word_counters()
+
+    def _mark_last_copied(self, txt: tk.Text) -> None:
+        # remove previous highlight
+        if self._last_copied_text is not None:
+            try:
+                _set_green_border(self._last_copied_text, False)
+            except Exception:
+                pass
+        self._last_copied_text = txt
+        try:
+            _set_green_border(txt, True)
+        except Exception:
+            pass
+
+    def _bind_select_all_shortcuts(self, t: tk.Text) -> None:
+        """
+        Ctrl+A or Ctrl+Ф (Russian layout), any case -> select all text in the widget.
+        Works by binding to Control-KeyPress and checking keysym/char.
+        """
+        def on_ctrl_keypress(event: tk.Event) -> str | None:
+            # On different platforms/layouts Tk may report Latin keysyms or Cyrillic keysyms,
+            # and event.char may contain 'a'/'A' or 'ф'/'Ф'.
+            keysym = (getattr(event, "keysym", "") or "")
+            char = (getattr(event, "char", "") or "")
+
+            keysym_l = keysym.lower()
+            char_l = char.lower()
+
+            is_select_all = (
+                keysym_l == "a"
+                or char_l == "a"
+                or char_l == "ф"
+                or keysym in ("Cyrillic_ef", "Cyrillic_EF")
+                or keysym_l.endswith("_ef")  # extra tolerance for some tk builds
+            )
+
+            if is_select_all:
+                try:
+                    t.tag_add("sel", "1.0", "end-1c")
+                    t.mark_set("insert", "1.0")
+                    t.see("insert")
+                except Exception:
+                    pass
+                return "break"
+            return None
+
+        # Bind only once per widget (idempotent enough)
+        t.bind("<Control-KeyPress>", on_ctrl_keypress, add=True)
+
+
     # ---------------- Actions ----------------
 
     def _on_edit_extracted_text(self) -> None:
@@ -752,18 +963,23 @@ class SemiManualSummaryDialog(tk.Toplevel):
         src = _get_text(extracted).strip()
         payload = (prompt + "\n\n" + src).strip() + "\n"
         _clipboard_set(self, payload)
+        self._mark_last_copied(extracted)
+        self._refresh_all_word_counters()
 
     def _copy_results_prompt_plus_extracted(self, extracted: tk.Text) -> None:
         prompt = _get_text(self.results_prompt).strip()
         src = _get_text(extracted).strip()
         payload = (prompt + "\n\n" + src).strip() + "\n"
         _clipboard_set(self, payload)
+        self._mark_last_copied(extracted)
+        self._refresh_all_word_counters()
 
     def _copy_keypoints_prompt_plus_summary(self) -> None:
         prompt = _get_text(self.kp_prompt).strip()
         src = _get_text(self.kp_summary).strip()
         payload = (prompt + "\n\n" + src).strip() + "\n"
         _clipboard_set(self, payload)
+        self._refresh_all_word_counters()
 
     def _on_cancel(self) -> None:
         try:
@@ -822,7 +1038,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
                     "Summary exists.",
                     "Summary DOCX already exists. Append?\n"
                     "YES  = Append\n"
-                    "NO   = Overwrite\n"
+                    "NO   = Overwrite\n",
                     default=messagebox.CANCEL,
                 )
                 if ans is None:
