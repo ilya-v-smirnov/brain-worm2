@@ -70,6 +70,10 @@ class ExtractedTextDialog(tk.Toplevel):
         self._result_widgets: list[_ResultSectionWidgets] = []
         self._figure_widgets: list[_FigureWidgets] = []
 
+        # Export/copy filters (default OFF)
+        self.include_methods_var = tk.BooleanVar(value=False)
+        self.include_figures_var = tk.BooleanVar(value=False)
+
         self._build_ui()
         self._load_json()
 
@@ -99,6 +103,25 @@ class ExtractedTextDialog(tk.Toplevel):
         ttk.Button(actions, text="Copy JSON", command=self._copy_json_from_disk).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Export to docx", command=self._export_to_docx).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Open PDF", command=self._on_open_pdf).pack(side=tk.LEFT)
+
+        options = ttk.Frame(header)
+        options.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        options.columnconfigure(0, weight=1)
+
+        # "Пружина" слева, чтобы чекбоксы уехали вправо
+        ttk.Label(options, text="").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        ttk.Checkbutton(
+            options,
+            text="Include Figure Captions",
+            variable=self.include_figures_var,
+        ).pack(side=tk.RIGHT)
+
+        ttk.Checkbutton(
+            options,
+            text="Include Methods",
+            variable=self.include_methods_var,
+        ).pack(side=tk.RIGHT, padx=(0, 16))
 
         common = ttk.Frame(root)
         common.grid(row=1, column=0, sticky="ew", pady=(10, 6))
@@ -150,7 +173,6 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self._setup_mousewheel_routing()
 
-
         bottom = ttk.Frame(root)
         bottom.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         bottom.columnconfigure(0, weight=1)
@@ -177,7 +199,7 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self._setup_paragraph_spacing(txt)
         return txt
-    
+
         # ---------------- Context menu: text helpers ----------------
 
     def _install_text_context_menu(self, txt: tk.Text) -> None:
@@ -248,7 +270,6 @@ class ExtractedTextDialog(tk.Toplevel):
 
         return "break"
 
-
     def _make_scrollable_tab(self, parent: ttk.Frame) -> tuple[tk.Canvas, ttk.Frame]:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
@@ -277,11 +298,8 @@ class ExtractedTextDialog(tk.Toplevel):
         inner.bind("<Configure>", on_inner_configure)
         canvas.bind("<Configure>", on_canvas_configure)
 
-        # mouse wheel support when cursor over tab
-
         return canvas, inner
 
-    
     def _is_descendant(self, widget: tk.Widget | None, ancestor: tk.Widget) -> bool:
         """True if widget is ancestor itself or inside it."""
         w = widget
@@ -303,8 +321,6 @@ class ExtractedTextDialog(tk.Toplevel):
         self._mousewheel_routing_installed = True
 
         def _on_wheel(event: tk.Event) -> str | None:
-            # When file dialogs or other toplevels are open, bind_all() still receives events.
-            # In that case winfo_containing() may point to '__tk_filedialog' and raise KeyError.
             try:
                 w = self.winfo_containing(event.x_root, event.y_root)
             except (KeyError, tk.TclError):
@@ -313,7 +329,6 @@ class ExtractedTextDialog(tk.Toplevel):
             if w is None:
                 return None
 
-            # Ignore wheel events coming from other Toplevel windows (e.g., __tk_filedialog)
             try:
                 if w.winfo_toplevel() is not self:
                     return None
@@ -321,7 +336,6 @@ class ExtractedTextDialog(tk.Toplevel):
                 return None
 
             if isinstance(w, tk.Text):
-                # Linux wheel buttons
                 if getattr(event, "num", None) == 4:
                     w.yview_scroll(-1, "units")
                 elif getattr(event, "num", None) == 5:
@@ -332,7 +346,6 @@ class ExtractedTextDialog(tk.Toplevel):
                         w.yview_scroll(int(-delta / 120), "units")
                 return "break"
 
-            # Prefer scrolling the tab-level canvas when not over Text
             target_canvas: tk.Canvas | None = None
             try:
                 if hasattr(self, "results_canvas") and self._is_descendant(w, self.results_canvas):
@@ -355,8 +368,6 @@ class ExtractedTextDialog(tk.Toplevel):
                     target_canvas.yview_scroll(int(-delta / 120), "units")
             return "break"
 
-
-        # Linux: Button-4/5. Windows/macOS: MouseWheel.
         self.bind_all("<Button-4>", _on_wheel)
         self.bind_all("<Button-5>", _on_wheel)
         self.bind_all("<MouseWheel>", _on_wheel)
@@ -411,8 +422,6 @@ class ExtractedTextDialog(tk.Toplevel):
                         section_text=str(item.get("section_text", "") or ""),
                     )
 
-
-        # If JSON has no result sections, keep one empty block for editing
         if not self._result_widgets:
             self._add_result_section()
 
@@ -427,18 +436,15 @@ class ExtractedTextDialog(tk.Toplevel):
                         caption=str(item.get("caption", "") or ""),
                     )
 
-
-        # If JSON has no figures, keep one empty block for editing
         if not self._figure_widgets:
             self._add_figure()
 
-        # ensure scrollregion updated
         self.results_canvas.update_idletasks()
         self.figures_canvas.update_idletasks()
 
     def _populate_from_data(self, data: dict[str, Any]) -> None:
         """Заполняет UI данными (без записи на диск)."""
-        self.original_data = data  # важно: Save будет строить new_data от этого
+        self.original_data = data
 
         self.title_var.set(str(data.get("title", "") or ""))
         self.year_var.set(str(data.get("year", "") or ""))
@@ -447,7 +453,6 @@ class ExtractedTextDialog(tk.Toplevel):
         self._set_text(self.methods_text, str(data.get("methods", "") or ""))
         self._set_text(self.discussion_text, str(data.get("discussion", "") or ""))
 
-        # Results
         self._clear_results()
         results = data.get("results") or []
         if isinstance(results, list):
@@ -460,7 +465,6 @@ class ExtractedTextDialog(tk.Toplevel):
         if not self._result_widgets:
             self._add_result_section()
 
-        # Figures
         self._clear_figures()
         figures = data.get("figures") or []
         if isinstance(figures, list):
@@ -476,7 +480,6 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self.results_canvas.update_idletasks()
         self.figures_canvas.update_idletasks()
-
 
     def _clear_results(self) -> None:
         for w in list(self._result_widgets):
@@ -497,15 +500,29 @@ class ExtractedTextDialog(tk.Toplevel):
     def _get_text(widget: tk.Text) -> str:
         return widget.get("1.0", tk.END).rstrip("\n")
 
-    
+    # ---------------- Export/copy filters ----------------
+
+    def _apply_export_filters(self, obj: dict[str, Any]) -> dict[str, Any]:
+        """
+        Returns a filtered COPY of obj according to UI tick-boxes:
+        - If Include Methods is OFF -> methods becomes ""
+        - If Include Figure Captions is OFF -> figures becomes []
+        """
+        out = deepcopy(obj)
+
+        if not bool(self.include_methods_var.get()):
+            if "methods" in out:
+                out["methods"] = ""
+
+        if not bool(self.include_figures_var.get()):
+            if "figures" in out:
+                out["figures"] = []
+
+        return out
+
     # ---------------- Text formatting helpers ----------------
 
     def _setup_paragraph_spacing(self, widget: tk.Text) -> None:
-        """
-        Visually separate paragraphs by adding extra spacing around empty lines.
-
-        Implementation detail: we tag blank lines with spacing1/spacing3.
-        """
         widget.tag_configure("blankline", spacing1=10, spacing3=10)
 
         def _on_modified(event: tk.Event) -> None:
@@ -534,7 +551,6 @@ class ExtractedTextDialog(tk.Toplevel):
                 widget.tag_add("blankline", line_start, line_end)
 
     def _setup_figure_caption_behavior(self, widget: tk.Text) -> None:
-        """Force captions to be a single paragraph: remove all newline characters."""
         widget.tag_configure("blankline", spacing1=10, spacing3=10)
 
         def _on_modified(event: tk.Event) -> None:
@@ -542,11 +558,9 @@ class ExtractedTextDialog(tk.Toplevel):
             if not w.edit_modified():
                 return
 
-            # Normalize newlines into spaces
             raw = w.get("1.0", tk.END).rstrip("\n")
             normalized = " ".join(raw.replace("\n", " ").split())
             if normalized != raw.strip():
-                # Preserve cursor as best we can
                 try:
                     insert = w.index(tk.INSERT)
                 except Exception:
@@ -565,7 +579,6 @@ class ExtractedTextDialog(tk.Toplevel):
         self._retag_blank_lines(widget)
 
     def _order_figures_by_number(self) -> None:
-        """Sort figure blocks by figure number (ascending). Non-numeric / empty go last."""
         def _key(w: _FigureWidgets) -> tuple[int, int]:
             raw = w.number_var.get().strip()
             try:
@@ -583,7 +596,7 @@ class ExtractedTextDialog(tk.Toplevel):
         self.figures_canvas.update_idletasks()
         self.figures_canvas.configure(scrollregion=self.figures_canvas.bbox("all"))
 
-# ---------------- Dynamic blocks: Results ----------------
+    # ---------------- Dynamic blocks: Results ----------------
 
     def _add_result_section(
         self,
@@ -592,14 +605,8 @@ class ExtractedTextDialog(tk.Toplevel):
         insert_index: int | None = None,
         focus_subtitle: bool = False,
     ) -> None:
-        """
-        Add a Results section UI block.
-
-        If insert_index is provided, the new block is inserted BEFORE the block at that index.
-        """
         frame = ttk.Frame(self.results_frame, padding=(0, 8, 0, 8))
 
-        # Insert into UI + list
         if insert_index is None or insert_index >= len(self._result_widgets):
             frame.pack(fill=tk.X, expand=True)
             list_index = len(self._result_widgets)
@@ -608,7 +615,6 @@ class ExtractedTextDialog(tk.Toplevel):
             frame.pack(fill=tk.X, expand=True, before=before_frame)
             list_index = insert_index
 
-        # Two-column layout: left content, right buttons
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=0)
 
@@ -620,13 +626,11 @@ class ExtractedTextDialog(tk.Toplevel):
         right = ttk.Frame(frame)
         right.grid(row=0, column=1, sticky="n", padx=(10, 12))
 
-        # Subtitle row
         title_var = tk.StringVar(value=section_title)
         ttk.Label(left, text="Subtitle:").grid(row=0, column=0, sticky="w")
         title_entry = ttk.Entry(left, textvariable=title_var)
         title_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
-        # Text box (taller)
         txt = tk.Text(left, wrap="word", height=9)
         scr = ttk.Scrollbar(left, orient=tk.VERTICAL, command=txt.yview)
         txt.configure(yscrollcommand=scr.set)
@@ -641,11 +645,8 @@ class ExtractedTextDialog(tk.Toplevel):
         self._install_text_context_menu(txt)
 
         w = _ResultSectionWidgets(frame=frame, title_var=title_var, title_entry=title_entry, text=txt)
-
-        # Insert into list at computed position
         self._result_widgets.insert(list_index, w)
 
-        # Button commands compute index dynamically (stable after insert/delete)
         ttk.Button(
             right,
             text="Add above",
@@ -670,7 +671,6 @@ class ExtractedTextDialog(tk.Toplevel):
             ),
         ).pack(fill=tk.X)
 
-        # update scroll region
         self.results_canvas.update_idletasks()
         self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
 
@@ -685,7 +685,6 @@ class ExtractedTextDialog(tk.Toplevel):
             self._result_widgets.remove(w)
         w.frame.destroy()
 
-        # Keep at least one empty section so the tab isn't "blank"
         if keep_one and not self._result_widgets:
             self._add_result_section()
 
@@ -694,7 +693,6 @@ class ExtractedTextDialog(tk.Toplevel):
 
     # ---------------- Dynamic blocks: Figures ----------------
 
-    
     def _add_figure(
         self,
         figure_number: str = "",
@@ -702,11 +700,6 @@ class ExtractedTextDialog(tk.Toplevel):
         insert_index: int | None = None,
         focus_number: bool = False,
     ) -> None:
-        """
-        Add a Figure UI block.
-
-        If insert_index is provided, the new block is inserted BEFORE the block at that index.
-        """
         frame = ttk.Frame(self.figures_frame, padding=(0, 8, 0, 8))
 
         if insert_index is None or insert_index >= len(self._figure_widgets):
@@ -799,7 +792,6 @@ class ExtractedTextDialog(tk.Toplevel):
         open_file(self.pdf_path)
 
     def _on_extract_text_again(self) -> None:
-        # Правило: никаких записей на диск. Только обновление UI.
         if not self.pdf_path:
             messagebox.showinfo("Extract text again", "PDF path is not available.")
             return
@@ -830,23 +822,21 @@ class ExtractedTextDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Extract text again", f"{type(e).__name__}: {e}")
 
-
     def _copy_json_from_disk(self) -> None:
         if not self.json_path.exists():
             messagebox.showerror("Copy JSON", f"JSON not found:\n{self.json_path}")
             return
         try:
             obj = json.loads(self.json_path.read_text(encoding="utf-8"))
+            obj = self._apply_export_filters(obj)
             txt = json.dumps(obj, ensure_ascii=False, indent=2)
         except Exception as e:
             messagebox.showerror("Copy JSON", f"{type(e).__name__}: {e}")
             return
         self.clipboard_clear()
         self.clipboard_append(txt)
-        messagebox.showinfo("Copy JSON", "Saved JSON has been copied to clipboard.")
 
     def _export_to_docx(self) -> None:
-        # Load JSON from disk (as requested)
         try:
             raw = self.json_path.read_text(encoding="utf-8")
             obj = json.loads(raw)
@@ -854,9 +844,9 @@ class ExtractedTextDialog(tk.Toplevel):
             messagebox.showerror("Error", f"Failed to read JSON:\n{e}")
             return
 
-        # Ask save path
+        obj = self._apply_export_filters(obj)
+
         default_name = (str(obj.get("title") or "article").strip() or "article")
-        # keep filename safe-ish
         default_name = "".join(ch if ch.isalnum() or ch in " _-." else "_" for ch in default_name)[:80]
 
         path = filedialog.asksaveasfilename(
@@ -879,8 +869,6 @@ class ExtractedTextDialog(tk.Toplevel):
             messagebox.showerror("Error", f"Failed to export docx:\n{e}")
             return
 
-        messagebox.showinfo("Export to docx", "DOCX exported successfully.")
-
 
     def _copy_text_from_disk(self) -> None:
         if not self.json_path.exists():
@@ -888,6 +876,7 @@ class ExtractedTextDialog(tk.Toplevel):
             return
         try:
             obj = json.loads(self.json_path.read_text(encoding="utf-8"))
+            obj = self._apply_export_filters(obj)
         except Exception as e:
             messagebox.showerror("Copy text", f"{type(e).__name__}: {e}")
             return
@@ -907,7 +896,10 @@ class ExtractedTextDialog(tk.Toplevel):
                 parts.append(f"\n{label}\n{t}")
 
         add_block("Introduction", str(obj.get("introduction", "") or ""))
-        add_block("Methods", str(obj.get("methods", "") or ""))
+
+        # Methods included only if checkbox ON
+        if bool(self.include_methods_var.get()):
+            add_block("Methods", str(obj.get("methods", "") or ""))
 
         results = obj.get("results") or []
         if isinstance(results, list) and results:
@@ -925,28 +917,29 @@ class ExtractedTextDialog(tk.Toplevel):
 
         add_block("Discussion", str(obj.get("discussion", "") or ""))
 
-        figures = obj.get("figures") or []
-        if isinstance(figures, list) and figures:
-            parts.append("\nFigures")
-            for item in figures:
-                if not isinstance(item, dict):
-                    continue
-                num = item.get("figure_number", "")
-                cap = str(item.get("caption", "") or "").strip()
-                if num is None:
-                    num = ""
-                num_s = str(num).strip()
-                if num_s or cap:
-                    header = f"Figure {num_s}".strip()
-                    if header:
-                        parts.append(f"\n{header}\n{cap}".rstrip())
-                    else:
-                        parts.append(f"\n{cap}".rstrip())
+        # Figures included only if checkbox ON
+        if bool(self.include_figures_var.get()):
+            figures = obj.get("figures") or []
+            if isinstance(figures, list) and figures:
+                parts.append("\nFigures")
+                for item in figures:
+                    if not isinstance(item, dict):
+                        continue
+                    num = item.get("figure_number", "")
+                    cap = str(item.get("caption", "") or "").strip()
+                    if num is None:
+                        num = ""
+                    num_s = str(num).strip()
+                    if num_s or cap:
+                        header = f"Figure {num_s}".strip()
+                        if header:
+                            parts.append(f"\n{header}\n{cap}".rstrip())
+                        else:
+                            parts.append(f"\n{cap}".rstrip())
 
         text_out = "\n".join(parts).strip() + "\n"
         self.clipboard_clear()
         self.clipboard_append(text_out)
-        messagebox.showinfo("Copy text", "Saved text has been copied to clipboard.")
 
     def _on_cancel(self) -> None:
         try:
@@ -962,11 +955,9 @@ class ExtractedTextDialog(tk.Toplevel):
         self._save_json(close_after=True)
 
     def _save_json(self, close_after: bool) -> bool:
-        """Validate, write JSON to disk. Returns True if saved."""
         try:
             new_data = deepcopy(self.original_data)
 
-            # ---- Required top-level fields ----
             title = self.title_var.get().strip()
             if not title:
                 raise ValueError("Title must not be empty.")
@@ -986,8 +977,6 @@ class ExtractedTextDialog(tk.Toplevel):
             new_data["introduction"] = introduction
 
             methods = self._get_text(self.methods_text).strip()
-            # if not methods:
-            #     raise ValueError("Methods must not be empty.")
             new_data["methods"] = methods
 
             discussion = self._get_text(self.discussion_text).strip()
@@ -995,7 +984,6 @@ class ExtractedTextDialog(tk.Toplevel):
                 raise ValueError("Discussion must not be empty.")
             new_data["discussion"] = discussion
 
-            # ---- Results: validate sections ----
             empty_text_sections: list[str] = []
             missing_title_sections: list[str] = []
             results: list[dict] = []
@@ -1023,7 +1011,6 @@ class ExtractedTextDialog(tk.Toplevel):
                     + "\n".join(f"- {x}" for x in missing_title_sections)
                 )
 
-            # ---- Figures: validate items ----
             empty_caption_figs: list[str] = []
             missing_number_figs: list[str] = []
             figures: list[dict] = []
@@ -1056,7 +1043,6 @@ class ExtractedTextDialog(tk.Toplevel):
                     + "\n".join(f"- {x}" for x in missing_number_figs)
                 )
 
-            # ---- Warning: drop sections without text/caption ----
             warn_lines: list[str] = []
             if empty_text_sections:
                 warn_lines.append("Results sections without text will not be saved:")
