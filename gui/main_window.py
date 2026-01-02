@@ -106,6 +106,22 @@ class MainWindow:
         self._ctx.add_separator()
         self._ctx.add_command(label="Delete…", command=self._ctx_delete_article)
         self.tree.bind("<Button-3>", self._on_right_click)
+        
+        # Remove old problematic binding (X11: FocusOut fires during tk_popup)
+        try:
+            self.master.unbind("<FocusOut>")
+        except Exception:
+            pass
+
+        # Autoclose context menu:
+        # - any left click outside the menu
+        # - window deactivated (Alt+Tab)
+        # - window minimized/unmapped
+        self.master.bind("<Button-1>", self._hide_ctx_menu, add="+")
+        self.master.bind("<Deactivate>", self._hide_ctx_menu, add="+")
+        self.master.bind("<Unmap>", self._hide_ctx_menu, add="+")
+
+
 
     # ---------------- Startup pipeline ----------------
 
@@ -126,7 +142,47 @@ class MainWindow:
 
     # ---------------- Tree building ----------------
 
+    def _collect_open_folder_keys(self) -> set[str]:
+        """
+        Collects 'folder_key' for currently expanded folders.
+        Uses payload['key'] which is stable across reloads.
+        """
+        open_keys: set[str] = set()
+
+        def walk(parent_iid: str) -> None:
+            for iid in self.tree.get_children(parent_iid):
+                payload = self._iid_to_payload.get(iid)
+                if payload and payload.get("type") == "folder":
+                    try:
+                        if bool(self.tree.item(iid, "open")):
+                            key = payload.get("key")
+                            if isinstance(key, str) and key:
+                                open_keys.add(key)
+                    except Exception:
+                        pass
+                    walk(iid)
+
+        walk("")
+        return open_keys
+
+    def _expand_first_branch(self) -> None:
+        """
+        Expands ONLY the very first root node (no deep expansion).
+        """
+        roots = self.tree.get_children("")
+        if not roots:
+            return
+
+        iid = roots[0]
+        try:
+            self.tree.item(iid, open=True)
+        except Exception:
+            pass
+
     def _reload_tree(self) -> None:
+        # Preserve expanded folders (by stable folder_key) before rebuilding
+        open_folder_keys = self._collect_open_folder_keys()
+
         self.tree.delete(*self.tree.get_children())
         self._iid_to_payload.clear()
 
@@ -137,13 +193,26 @@ class MainWindow:
         def ensure_folder(parent_iid: str, folder_key: str, name: str) -> str:
             if folder_key in folder_iids:
                 return folder_iids[folder_key]
+
             iid = self.tree.insert(parent_iid, "end", text=name, values=("", "", ""))
             self._iid_to_payload[iid] = {"type": "folder", "key": folder_key}
             folder_iids[folder_key] = iid
+
+            # Restore open state for previously expanded folders
+            if folder_key in open_folder_keys:
+                try:
+                    self.tree.item(iid, open=True)
+                except Exception:
+                    pass
+
             return iid
 
         for row in rows:
             self._insert_pdf_row(row, ensure_folder)
+
+        # If nothing was open (e.g., first app start), expand the first branch
+        if not open_folder_keys:
+            self._expand_first_branch()
 
     def _insert_pdf_row(self, row: FileRow, ensure_folder) -> None:
         parts = row.pdf_path.split("/")
@@ -263,7 +332,7 @@ class MainWindow:
                 return
             pdf_path = Path(self.db.resolve_path(pdf_rel))
 
-            SemiManualSummaryDialog(
+            win = SemiManualSummaryDialog(
                 self.master,
                 json_path=json_path,
                 pdf_path=pdf_path,
@@ -272,6 +341,12 @@ class MainWindow:
                 article_id=article_id,
                 existing_summary_path=payload.get("summary_path"),
             )
+            # After dialog closes, refresh the tree (summary path might have changed)
+            try:
+                self.master.wait_window(win)
+            except Exception:
+                pass
+            self._reload_tree()
             return
 
         if mode == "auto":
@@ -372,6 +447,8 @@ class MainWindow:
             open_rel(payload.get("lecture_audio_path"))
 
     def _on_right_click(self, event: tk.Event) -> None:
+        self._hide_ctx_menu()
+
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
@@ -384,8 +461,13 @@ class MainWindow:
 
         try:
             self._ctx.tk_popup(event.x_root, event.y_root)
+            self._ctx_posted = True
+            self._start_ctx_watch()
         finally:
-            self._ctx.grab_release()
+            try:
+                self._ctx.grab_release()
+            except Exception:
+                pass
 
     def _on_view_extracted_text(self) -> None:
         payload = self._get_selected_payload()
@@ -628,4 +710,43 @@ class MainWindow:
             msg += "\n\nОшибки:\n" + "\n".join(report.errors)
 
         messagebox.showinfo("Delete result", msg)
+
+    def _hide_ctx_menu(self, _event: tk.Event | None = None) -> None:
+        try:
+            self._ctx.unpost()
+        except Exception:
+            pass
+        self._ctx_posted = False
+
+    def _start_ctx_watch(self) -> None:
+        """
+        While context menu is posted, periodically check if the toplevel lost focus.
+        This is the most reliable way on Ubuntu/X11 where <Deactivate> may not fire.
+        """
+        if getattr(self, "_ctx_watch_running", False):
+            return
+        self._ctx_watch_running = True
+
+        def _tick() -> None:
+            if not getattr(self, "_ctx_posted", False):
+                self._ctx_watch_running = False
+                return
+
+            try:
+                # If the window is not the focus owner (Alt+Tab), focus_displayof() becomes None.
+                # On minimize/unmap, winfo_viewable() becomes False.
+                inactive = (self.master.focus_displayof() is None) or (not bool(self.master.winfo_viewable()))
+            except Exception:
+                inactive = True
+
+            if inactive:
+                self._hide_ctx_menu()
+                self._ctx_watch_running = False
+                return
+
+            self.master.after(100, _tick)
+
+        self.master.after(100, _tick)
+
+
 
