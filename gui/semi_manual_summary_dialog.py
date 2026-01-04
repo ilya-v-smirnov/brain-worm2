@@ -716,7 +716,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
             r.frame.destroy()
         self._result_rows.clear()
 
-    def _add_result_row(self, *, section_title: str, extracted: str) -> None:
+    def _add_result_row(self, *, section_title: str, extracted: str, summary_init: str = "") -> None:
         f = ttk.Frame(self.results_sections_frame, padding=(0, 8, 0, 8))
         f.pack(fill=tk.X, expand=True)
 
@@ -737,6 +737,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
         sum_block = _make_labeled_block(grid, "Summary")
         sum_block.grid(row=0, column=1, sticky="nsew")
         summary_txt = _make_text(sum_block, height=8, readonly=False)
+        _set_text(summary_txt, summary_init or "", readonly=False)
         sum_words = ttk.Label(sum_block, text="Words: 0, 0%")
         sum_words.grid(row=2, column=0, sticky="e", pady=(4, 0))
 
@@ -978,7 +979,87 @@ class SemiManualSummaryDialog(tk.Toplevel):
             json_path=self.json_path,
             pdf_path=self.pdf_path,
             parse_pdf_func=self.parse_pdf_func,
+            on_saved_close=self._on_extracted_saved_close,
         )
+
+
+    def _on_extracted_saved_close(self) -> None:
+        """Called when the dependent Extracted Text window saved and closed."""
+        self._reload_extracted_fields(preserve_summaries=True)
+
+    def _reload_extracted_fields(self, *, preserve_summaries: bool = True) -> None:
+        """
+        Reload only *extracted/source* fields (Title/Year + Extracted blocks) from JSON on disk.
+        Keeps user-written Summary fields intact; for Results, attempts to preserve per-section summaries
+        by matching on section_title.
+        """
+        try:
+            new_data = _read_json(self.json_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to reload JSON:\n{type(e).__name__}: {e}")
+            return
+
+        # Keep internal copy in sync
+        self.data = new_data
+
+        # --- Title/Year + main extracted blocks ---
+        self.title_lbl.configure(text=_safe_str(new_data.get("title", "")))
+        self.year_lbl.configure(text=_safe_str(new_data.get("year", "")))
+
+        _set_text(self.intro_extracted, _safe_str(new_data.get("introduction", "")), readonly=True)
+        _set_text(self.methods_extracted, _safe_str(new_data.get("methods", "")), readonly=True)
+        _set_text(self.disc_extracted, _safe_str(new_data.get("discussion", "")), readonly=True)
+
+        # --- Figures captions -> one extracted block ---
+        captions: list[str] = []
+        figures = new_data.get("figures") or []
+        if isinstance(figures, list):
+            for it in figures:
+                if not isinstance(it, dict):
+                    continue
+                num = _safe_str(it.get("figure_number", "")).strip()
+                cap = _safe_str(it.get("caption", "")).strip()
+                if not (num or cap):
+                    continue
+                head = f"Figure {num}".strip()
+                captions.append(f"{head}\n{cap}".strip() if (head and cap) else (cap or head))
+        _set_text(self.figcap_extracted, "\n\n".join(captions).strip(), readonly=True)
+
+        # --- Results (preserve summaries if possible) ---
+        old_summaries_by_title: dict[str, list[str]] = {}
+        if preserve_summaries:
+            for r in self._result_rows:
+                key = (r.section_title or "").strip()
+                old_summaries_by_title.setdefault(key, []).append(_get_text(r.summary_text).strip())
+
+        # rebuild rows based on new extracted Results
+        self._clear_results_ui()
+        results = new_data.get("results") or []
+        if isinstance(results, list) and results:
+            for it in results:
+                if not isinstance(it, dict):
+                    continue
+                title = _safe_str(it.get("section_title", "")).strip()
+                text = _safe_str(it.get("section_text", "")).strip()
+
+                init_summary = ""
+                if preserve_summaries:
+                    bucket = old_summaries_by_title.get(title, [])
+                    if bucket:
+                        init_summary = bucket.pop(0)
+
+                self._add_result_row(section_title=title, extracted=text, summary_init=init_summary)
+        else:
+            self._add_result_row(section_title="(no sections in JSON)", extracted="", summary_init="")
+
+        try:
+            self.results_canvas.update_idletasks()
+            self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
+        except Exception:
+            pass
+
+        # Refresh counters after extracted changed
+        self._refresh_all_word_counters()
 
     def _on_open_pdf(self) -> None:
         if not self.pdf_path:

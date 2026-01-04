@@ -47,6 +47,7 @@ class ExtractedTextDialog(tk.Toplevel):
         json_path: Path,
         pdf_path: Path | None = None,
         parse_pdf_func: Callable[[Path], dict[str, Any]] | None = None,
+        on_saved_close: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master)
         self.title("Extracted Text")
@@ -66,6 +67,9 @@ class ExtractedTextDialog(tk.Toplevel):
         self.json_path = json_path
         self.pdf_path = pdf_path
         self.parse_pdf_func = parse_pdf_func
+
+        self._on_saved_close = on_saved_close
+        self._notify_parent = master
 
         self.original_data: dict = {}
         self._result_widgets: list[_ResultSectionWidgets] = []
@@ -1068,8 +1072,22 @@ class ExtractedTextDialog(tk.Toplevel):
             self.json_path.write_text(json.dumps(new_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
             if close_after:
+                cb = getattr(self, "_on_saved_close", None)
+                if cb is not None:
+                    try:
+                        parent = getattr(self, "_notify_parent", None) or getattr(self, "master", None)
+                        if parent is not None and hasattr(parent, "after"):
+                            parent.after(0, cb)   # важно: планируем на parent, не на закрываемом Toplevel
+                        else:
+                            cb()
+                    except Exception:
+                        try:
+                            cb()
+                        except Exception:
+                            pass
                 self._on_cancel()
             return True
+
         except Exception as e:
             messagebox.showerror("Save error", f"{type(e).__name__}: {e}")
             return False
