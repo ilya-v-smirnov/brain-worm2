@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from gui.file_ops import open_file
 from docx_utils.docx_writer import export_extracted_text_to_docx
+from gui.find_replace_dialog import FindReplaceDialog, FindReplaceState
 
 
 @dataclass
@@ -76,6 +77,7 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self._build_ui()
         self._load_json()
+        self._install_find_shortcut()
 
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
@@ -131,10 +133,12 @@ class ExtractedTextDialog(tk.Toplevel):
         self.year_var = tk.StringVar()
 
         ttk.Label(common, text="Title:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(common, textvariable=self.title_var).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.title_entry = ttk.Entry(common, textvariable=self.title_var)
+        self.title_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
         ttk.Label(common, text="Year:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(common, textvariable=self.year_var, width=12).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        self.year_entry = ttk.Entry(common, textvariable=self.year_var, width=12)
+        self.year_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
         self.nb = ttk.Notebook(root)
         self.nb.grid(row=2, column=0, sticky="nsew")
@@ -1069,3 +1073,324 @@ class ExtractedTextDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Save error", f"{type(e).__name__}: {e}")
             return False
+
+    # ---------------- Find/Replace (Ctrl+F) ----------------
+
+    def _install_find_shortcut(self) -> None:
+        if getattr(self, "_find_shortcut_installed", False):
+            return
+        self._find_shortcut_installed = True
+
+        # Ctrl+F (latin), Ctrl+А (russian layout key for F)
+        def on_ctrl_keypress(event: tk.Event) -> str | None:
+            keysym = (getattr(event, "keysym", "") or "")
+            char = (getattr(event, "char", "") or "")
+            if char in ("f", "F", "а", "А") or keysym in ("f", "F", "Cyrillic_a", "Cyrillic_A"):
+                self._open_find_replace()
+                return "break"
+            return None
+
+        # bind on toplevel: works even when focus is inside Text
+        self.bind("<Control-KeyPress>", on_ctrl_keypress, add=True)
+
+    def _open_find_replace(self) -> None:
+        # lazy import to avoid circulars if needed
+        from gui.find_replace_dialog import FindReplaceDialog, FindReplaceState
+
+        dlg = getattr(self, "_find_dialog", None)
+        if dlg is not None:
+            try:
+                if dlg.winfo_exists():
+                    dlg.lift()
+                    return
+            except Exception:
+                pass
+
+        if not hasattr(self, "_find_state"):
+            self._find_state = FindReplaceState()
+
+        self._find_dialog = FindReplaceDialog(self, provider=self, state=self._find_state)
+
+    def _fr_targets(self) -> list[tk.Widget]:
+        """
+        IMPORTANT: returns ALL editable fields, not just current tab.
+        """
+        out: list[tk.Widget] = []
+
+        # Title/Year
+        if hasattr(self, "title_entry"):
+            out.append(self.title_entry)
+        if hasattr(self, "year_entry"):
+            out.append(self.year_entry)
+
+        # Main tabs
+        out.append(self.intro_text)
+        out.append(self.methods_text)
+        out.append(self.discussion_text)
+
+        # Results dynamic blocks
+        for w in getattr(self, "_result_widgets", []):
+            out.append(w.title_entry)
+            out.append(w.text)
+
+        # Figures dynamic blocks
+        for w in getattr(self, "_figure_widgets", []):
+            out.append(w.number_entry)
+            out.append(w.caption)
+
+        return out
+
+    def _fr_current_target_index(self, targets: list[tk.Widget]) -> int:
+        """
+        If focus is in Find dialog, focus_get() is not one of targets.
+        In that case, continue from last found target.
+        """
+        try:
+            cur = self.focus_get()
+        except Exception:
+            cur = None
+
+        if cur in targets:
+            return targets.index(cur)
+
+        # focus is elsewhere (e.g., Find dialog) -> continue from last found target
+        idx = getattr(self, "_fr_last_target_idx", None)
+        if isinstance(idx, int) and 0 <= idx < len(targets):
+            return idx
+
+        return 0
+
+    def _fr_select_entry(self, ent: ttk.Entry, s: int, e: int) -> None:
+        ent.focus_set()
+        ent.selection_range(s, e)
+        ent.icursor(e)
+
+    def _fr_select_text(self, txt: tk.Text, s: str, e: str) -> None:
+        txt.focus_set()
+        txt.tag_remove("sel", "1.0", tk.END)
+        txt.tag_add("sel", s, e)
+        txt.mark_set(tk.INSERT, e)
+        txt.see(s)
+
+    def fr_find_next(self, query: str, *, match_case: bool) -> bool:
+        targets = self._fr_targets()
+        if not targets or not query:
+            return False
+
+        # detect whether focus is actually inside a target widget
+        try:
+            cur_focus = self.focus_get()
+        except Exception:
+            cur_focus = None
+        focus_in_targets = cur_focus in targets
+
+        start_i = self._fr_current_target_index(targets)
+
+        def _find_in_widget(w: tk.Widget, *, from_cursor: bool) -> tuple[bool, int | str, int | str]:
+            if isinstance(w, ttk.Entry):
+                text = w.get()
+                hay = text if match_case else text.lower()
+                needle = query if match_case else query.lower()
+
+                start = 0
+                if from_cursor:
+                    try:
+                        if w.selection_present():
+                            start = int(w.index("sel.last"))
+                        else:
+                            start = int(w.index(tk.INSERT))
+                    except Exception:
+                        start = 0
+
+                pos = hay.find(needle, start)
+                if pos < 0:
+                    return (False, -1, -1)
+                return (True, pos, pos + len(query))
+
+            if isinstance(w, tk.Text):
+                nocase = 0 if match_case else 1
+                start_idx = "1.0"
+                if from_cursor:
+                    try:
+                        start_idx = w.index("sel.last")
+                    except Exception:
+                        try:
+                            start_idx = w.index(tk.INSERT)
+                        except Exception:
+                            start_idx = "1.0"
+
+                idx = w.search(query, start_idx, stopindex="end-1c", nocase=nocase)
+                if not idx:
+                    return (False, "", "")
+                end = f"{idx}+{len(query)}c"
+                return (True, idx, end)
+
+            return (False, -1, -1)
+
+        # PHASE 1 (no wrap inside widget):
+        # On the first checked widget we MUST search "from cursor/selection" even if focus is in Find dialog.
+        for step in range(len(targets)):
+            i = start_i + step
+            if i >= len(targets):
+                break
+            w = targets[i]
+
+            from_cursor = (step == 0) and (focus_in_targets or hasattr(self, "_fr_last_target_idx"))
+            found, s, e = _find_in_widget(w, from_cursor=from_cursor)
+            if found:
+                if isinstance(w, ttk.Entry):
+                    self._fr_select_entry(w, int(s), int(e))  # type: ignore[arg-type]
+                else:
+                    self._fr_select_text(w, str(s), str(e))  # type: ignore[arg-type]
+
+                # remember where we are, so next click continues even if focus is in Find dialog
+                self._fr_last_target_idx = i
+                return True
+
+        # PHASE 2 (wrap across targets):
+        for i in range(0, start_i + 1):
+            w = targets[i]
+            found, s, e = _find_in_widget(w, from_cursor=False)
+            if found:
+                if isinstance(w, ttk.Entry):
+                    self._fr_select_entry(w, int(s), int(e))  # type: ignore[arg-type]
+                else:
+                    self._fr_select_text(w, str(s), str(e))  # type: ignore[arg-type]
+                self._fr_last_target_idx = i
+                return True
+
+        return False
+    
+    def fr_replace_current(self, query: str, replacement: str, *, match_case: bool) -> bool:
+        """
+        Replace current match (selection). If no suitable selection -> Find next, then replace.
+        After replacing, moves to next match.
+        """
+        def _sel_matches(s: str) -> bool:
+            return s == query if match_case else s.lower() == query.lower()
+
+        def _replace_in_entry(ent: ttk.Entry) -> bool:
+            try:
+                if not ent.selection_present():
+                    return False
+                s = int(ent.index("sel.first"))
+                e = int(ent.index("sel.last"))
+                selected = ent.get()[s:e]
+                if not _sel_matches(selected):
+                    return False
+                new_text = ent.get()[:s] + replacement + ent.get()[e:]
+                ent.delete(0, tk.END)
+                ent.insert(0, new_text)
+                ent.selection_range(s, s + len(replacement))
+                ent.icursor(s + len(replacement))
+                return True
+            except Exception:
+                return False
+
+        def _replace_in_text(txt: tk.Text) -> bool:
+            try:
+                s = txt.index("sel.first")
+                e = txt.index("sel.last")
+                selected = txt.get(s, e)
+                if not _sel_matches(selected):
+                    return False
+                txt.delete(s, e)
+                txt.insert(s, replacement)
+                new_end = f"{s}+{len(replacement)}c"
+                txt.tag_remove("sel", "1.0", tk.END)
+                txt.tag_add("sel", s, new_end)
+                txt.mark_set(tk.INSERT, new_end)
+                txt.see(s)
+                return True
+            except tk.TclError:
+                return False
+            except Exception:
+                return False
+
+        # 1) Try replace current selection
+        try:
+            w = self.focus_get()
+        except Exception:
+            w = None
+
+        replaced = False
+        if isinstance(w, ttk.Entry):
+            replaced = _replace_in_entry(w)
+        elif isinstance(w, tk.Text):
+            replaced = _replace_in_text(w)
+
+        # 2) If nothing replaced -> find next and replace that
+        if not replaced:
+            if not self.fr_find_next(query, match_case=match_case):
+                return False
+            try:
+                w = self.focus_get()
+            except Exception:
+                w = None
+            if isinstance(w, ttk.Entry):
+                replaced = _replace_in_entry(w)
+            elif isinstance(w, tk.Text):
+                replaced = _replace_in_text(w)
+
+        # 3) move forward
+        self.fr_find_next(query, match_case=match_case)
+        return replaced
+
+
+    def fr_replace_all(self, query: str, replacement: str, *, match_case: bool) -> int:
+        targets = self._fr_targets()
+        if not targets:
+            return 0
+
+        total = 0
+
+        for w in targets:
+            if isinstance(w, ttk.Entry):
+                text = w.get()
+                if not query:
+                    continue
+                if match_case:
+                    cnt = text.count(query)
+                    if cnt:
+                        w.delete(0, tk.END)
+                        w.insert(0, text.replace(query, replacement))
+                        total += cnt
+                else:
+                    # case-insensitive replace (simple, non-regex)
+                    low = text.lower()
+                    needle = query.lower()
+                    if needle not in low:
+                        continue
+                    # rebuild
+                    out = []
+                    i = 0
+                    while True:
+                        j = low.find(needle, i)
+                        if j < 0:
+                            out.append(text[i:])
+                            break
+                        out.append(text[i:j])
+                        out.append(replacement)
+                        i = j + len(query)
+                        total += 1
+                    new_text = "".join(out)
+                    w.delete(0, tk.END)
+                    w.insert(0, new_text)
+
+            elif isinstance(w, tk.Text):
+                # iterative search to keep tags/indices stable
+                if not query:
+                    continue
+                start = "1.0"
+                nocase = 0 if match_case else 1
+                while True:
+                    idx = w.search(query, start, stopindex="end-1c", nocase=nocase)
+                    if not idx:
+                        break
+                    end = f"{idx}+{len(query)}c"
+                    w.delete(idx, end)
+                    w.insert(idx, replacement)
+                    total += 1
+                    start = f"{idx}+{len(replacement)}c"
+
+        return total
