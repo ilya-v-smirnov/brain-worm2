@@ -67,6 +67,12 @@ class FindReplaceDialog(tk.Toplevel):
         self.repl_entry = ttk.Entry(root, textvariable=self.repl_var, width=40)
         self.repl_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
 
+        # Track last active entry to support "insert where cursor is"
+        self._last_entry: tk.Entry | None = self.find_entry
+        self.find_entry.bind("<FocusIn>", lambda _e: self._set_last_entry(self.find_entry), add="+")
+        self.repl_entry.bind("<FocusIn>", lambda _e: self._set_last_entry(self.repl_entry), add="+")
+        self._shift_once = False
+
         opts = ttk.Frame(root)
         opts.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         ttk.Checkbutton(opts, text="Match case", variable=self.match_case_var).pack(anchor="w")
@@ -84,6 +90,73 @@ class FindReplaceDialog(tk.Toplevel):
         # Optional: spacer button slot (keeps layout flexible)
         ttk.Label(btns, text="").grid(row=0, column=4, sticky="ew")
 
+        # --- Greek alphabet panel (lowercase) + one-shot Shift ---
+        greek = ttk.Frame(root)
+        greek.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        # Layout: Shift + letters in a compact grid
+        # You can tweak columns count to taste; 10 fits well for typical window widths.
+        columns = 10
+        for c in range(columns):
+            greek.columnconfigure(c, weight=1)
+
+        self._shift_btn = ttk.Button(greek, text="Shift", command=self._arm_shift_once)
+        self._shift_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+
+        letters = list("αβγδεζηθικλμνξοπρστυφχψω") + ["ς", "×", "°"]  # + final sigma, multiply, degree
+
+        # Start placing from column 1 because column 0 is Shift
+        r = 0
+        c = 1
+        for ch in letters:
+            b = ttk.Button(greek, text=ch, width=3, command=lambda x=ch: self._insert_greek(x))
+            b.grid(row=r, column=c, sticky="ew", padx=(0, 6), pady=(0, 6))
+            c += 1
+            if c >= columns:
+                r += 1
+                c = 0
+
+    def _set_last_entry(self, entry: tk.Entry) -> None:
+        self._last_entry = entry
+
+    def _arm_shift_once(self) -> None:
+        self._shift_once = True
+        # small visual cue
+        try:
+            self._shift_btn.configure(text="Shift*")
+        except Exception:
+            pass
+
+    def _insert_greek(self, ch: str) -> None:
+        # Decide case for one shot
+        out = ch.upper() if self._shift_once else ch
+
+        # Prefer the widget that currently owns focus, if it's an Entry
+        w = self.focus_get()
+        target = None
+        if isinstance(w, (tk.Entry, ttk.Entry)):
+            target = w
+        else:
+            target = self._last_entry or self.find_entry
+
+        try:
+            target.insert(tk.INSERT, out)
+            target.focus_set()
+        except Exception:
+            # fallback: find_entry
+            try:
+                self.find_entry.insert(tk.INSERT, out)
+                self.find_entry.focus_set()
+            except Exception:
+                pass
+
+        # Auto-reset shift after one insertion
+        if self._shift_once:
+            self._shift_once = False
+            try:
+                self._shift_btn.configure(text="Shift")
+            except Exception:
+                pass
 
     def _snapshot_state(self) -> None:
         self.state.last_query = (self.find_var.get() or "").strip()
