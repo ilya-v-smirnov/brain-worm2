@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import List, Tuple
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
@@ -293,6 +294,86 @@ def _abbrev_simple_table(doc: Document, pairs: List[tuple[str, str]]):
         for cell in row:
             for para in cell.paragraphs:
                 para.paragraph_format.space_after = Pt(0)
+
+def _parse_abbreviation_pairs(text: str) -> List[Tuple[str, str]]:
+    """
+    Parses Variant A:
+      ABBR — definition
+    Accepts separators: em dash (—), en dash (–), hyphen (-), colon (:).
+    Ignores empty and non-matching lines.
+    """
+    pairs: List[Tuple[str, str]] = []
+    if not text:
+        return pairs
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        m = re.match(r"^\s*(.+?)\s*(?:—|–|-|:)\s*(.+?)\s*$", line)
+        if not m:
+            continue
+
+        abbr = m.group(1).strip()
+        definition = m.group(2).strip()
+        if abbr and definition:
+            pairs.append((abbr, definition))
+
+    return pairs
+
+def _set_table_borders_none(table) -> None:
+    """
+    Removes visible borders for a python-docx table by setting tblBorders to 'nil'.
+    """
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    tbl = table._tbl
+    tblPr = tbl.tblPr
+    tblBorders = tblPr.find(qn("w:tblBorders"))
+    if tblBorders is None:
+        tblBorders = OxmlElement("w:tblBorders")
+        tblPr.append(tblBorders)
+
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        element = tblBorders.find(qn(f"w:{edge}"))
+        if element is None:
+            element = OxmlElement(f"w:{edge}")
+            tblBorders.append(element)
+        element.set(qn("w:val"), "nil")
+
+
+def _abbrev_simple_table(doc: Document, pairs: List[Tuple[str, str]]):
+    """
+    Draws ONLY the table (no H2 header here).
+    Borders are removed (transparent).
+    """
+    if not pairs:
+        return
+
+    table = doc.add_table(rows=1, cols=2)
+    table.autofit = True
+    _set_table_borders_none(table)
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "Abbreviation"
+    hdr[1].text = "Definition"
+    for cell in hdr:
+        for para in cell.paragraphs:
+            para.paragraph_format.space_after = Pt(0)
+            # make header bold
+            for run in para.runs:
+                run.bold = True
+
+    for abbr, expanded in pairs:
+        row = table.add_row().cells
+        row[0].text = abbr or ""
+        row[1].text = expanded or ""
+        for cell in row:
+            for para in cell.paragraphs:
+                para.paragraph_format.space_after = Pt(0)
+
 
 def _add_page_break_if_needed(doc: Document) -> None:
     if len(doc.paragraphs) > 0 or len(doc.tables) > 0:
@@ -670,6 +751,17 @@ def append_semi_manual_summary_to_docx(
         _apply_body(p, style)
     _blank(doc, 1)
 
+    # === ABBREVIATIONS ===
+    _heading_h2(doc, "Abbreviations")
+    abbr_text = str(summary.get("abbreviations") or "")
+    abbr_pairs = _parse_abbreviation_pairs(abbr_text)
+    if abbr_pairs:
+        _abbrev_simple_table(doc, abbr_pairs)
+    else:
+        p = doc.add_paragraph("—")
+        _apply_body(p, style)
+    _blank(doc, 1)
+
     # === SECTIONS ===
     def add_h2(name: str) -> None:
         _heading_h2(doc, name)
@@ -721,9 +813,3 @@ def append_semi_manual_summary_to_docx(
 
     doc.save(str(docx_path))
 
-    # Debug artifact рядом: сохраним payload, чтобы можно было восстановить состояние
-    try:
-        json_path = docx_path.with_suffix(".semi_manual.summary.json")
-        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass

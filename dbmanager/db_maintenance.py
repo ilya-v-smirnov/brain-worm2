@@ -323,7 +323,14 @@ def extract_contents_for_new_articles(
             json_rel_path = (contents_dir.name + "/" + json_name)
             json_abs_path = project_home / json_rel_path
 
+            # --- IMPORTANT: do not overwrite existing extracted JSON automatically ---
+            # Only create it if it does not exist on disk, unless force=True AND explicit article_ids provided.
+            # (Even then, you may want to overwrite only from the "Extracted text" window.)
+            if json_abs_path.exists() and not force:
+                continue
+
             _save_json_file(parsed, json_abs_path)
+
 
             # Обновляем Article.json_path относительным путём
             cur.execute(

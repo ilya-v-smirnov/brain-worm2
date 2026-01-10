@@ -144,6 +144,11 @@ class ExtractedTextDialog(tk.Toplevel):
         self.year_entry = ttk.Entry(common, textvariable=self.year_var, width=12)
         self.year_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
+        self._bind_select_all_shortcuts(self.title_entry)
+        self._bind_select_all_shortcuts(self.year_entry)
+
+
+
         self.nb = ttk.Notebook(root)
         self.nb.grid(row=2, column=0, sticky="nsew")
 
@@ -165,6 +170,10 @@ class ExtractedTextDialog(tk.Toplevel):
         self.intro_text = self._text_area(self.tab_intro)
         self.methods_text = self._text_area(self.tab_methods)
         self.discussion_text = self._text_area(self.tab_discussion)
+
+        self._bind_select_all_shortcuts(self.intro_text)
+        self._bind_select_all_shortcuts(self.methods_text)
+        self._bind_select_all_shortcuts(self.discussion_text)
 
         # Context menu + Ctrl+M
         self._install_text_context_menu(self.intro_text)
@@ -688,6 +697,9 @@ class ExtractedTextDialog(tk.Toplevel):
             except Exception:
                 pass
 
+        self._bind_select_all_shortcuts(title_entry)
+        self._bind_select_all_shortcuts(txt)
+
     def _delete_result_section(self, w: _ResultSectionWidgets, keep_one: bool = True) -> None:
         if w in self._result_widgets:
             self._result_widgets.remove(w)
@@ -783,6 +795,9 @@ class ExtractedTextDialog(tk.Toplevel):
                 num_entry.focus_set()
             except Exception:
                 pass
+
+        self._bind_select_all_shortcuts(num_entry)
+        self._bind_select_all_shortcuts(cap)
 
     def _delete_figure(self, w: _FigureWidgets, keep_one: bool = True) -> None:
         if w in self._figure_widgets:
@@ -1093,6 +1108,50 @@ class ExtractedTextDialog(tk.Toplevel):
             return False
 
     # ---------------- Find/Replace (Ctrl+F) ----------------
+
+    def _bind_select_all_shortcuts(self, w: tk.Widget) -> None:
+        """
+        Ctrl+A or Ctrl+Ф (Russian layout), any case -> select all text in widget.
+        Works by binding to Control-KeyPress and checking keysym/char.
+        Supports tk.Text and ttk.Entry.
+        """
+
+        def on_ctrl_keypress(event: tk.Event) -> str | None:
+            keysym = (getattr(event, "keysym", "") or "")
+            char = (getattr(event, "char", "") or "")
+
+            keysym_l = keysym.lower()
+            char_l = char.lower()
+
+            is_select_all = (
+                keysym_l == "a"
+                or char_l == "a"
+                or char_l == "ф"
+                or keysym in ("Cyrillic_ef", "Cyrillic_EF")
+                or keysym_l.endswith("_ef")  # extra tolerance for some tk builds
+            )
+
+            if not is_select_all:
+                return None
+
+            try:
+                if isinstance(w, ttk.Entry):
+                    w.selection_range(0, tk.END)
+                    w.icursor(tk.END)
+                    return "break"
+
+                if isinstance(w, tk.Text):
+                    w.tag_add("sel", "1.0", "end-1c")
+                    w.mark_set("insert", "1.0")
+                    w.see("insert")
+                    return "break"
+            except Exception:
+                return "break"
+
+            return None
+
+        # bind on the widget itself; add=True so we don't override other bindings
+        w.bind("<Control-KeyPress>", on_ctrl_keypress, add=True)
 
     def _install_find_shortcut(self) -> None:
         if getattr(self, "_find_shortcut_installed", False):

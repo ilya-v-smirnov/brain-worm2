@@ -14,6 +14,9 @@
   "key_points": {
     "template": "In {LANG}, produce 3–8 key bullet points capturing the paper’s main contributions and outcomes.  No speculation, just authors' interpretations. Give me a short structured piece of text ready to copy. Do not add comments to your response."
   },
+  "abbreviations": {
+    "template": "In {LANG}, extract all abbreviations used in the article and provide their full definitions. Return ONLY a clean list of abbreviation–definition pairs, one per line, in the format: ABBR — definition. No extra text."
+  },
   "figure_narrative": {
     "template": "In {LANG}, create a coherent narrative of the figures: what each figure shows and the overall story. IMPORTANT: keep all figure references. Give me a short structured piece of text ready to copy. Do not add comments to your response."
   }

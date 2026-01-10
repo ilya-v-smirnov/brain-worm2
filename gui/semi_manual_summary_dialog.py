@@ -76,27 +76,24 @@ def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 
-def _mirrored_docx_path_from_pdf(pdf_path: Path) -> Path:
+def _mirrored_docx_path_from_pdf(*, project_home: Path, pdf_path: Path) -> Path:
     """
-    Пример:
-      Article database/f1/f2/2025 Title.pdf
-    -> PDF_summaries/f1/f2/2025 Title.docx
-
-    Корень считается как папка-родитель каталога "Article database".
+    Map:
+      <project_home>/Article Database/folder1/folder2/file.pdf
+    -> <project_home>/PDF_summaries/folder1/folder2/file.docx
     """
     pdf_path = Path(pdf_path).resolve()
-    parts = list(pdf_path.parts)
+    project_home = Path(project_home).resolve()
+
+    articles_root = project_home / "Article Database"
+    summaries_root = project_home / "PDF_summaries"
 
     try:
-        idx = parts.index("Article database")
+        rel = pdf_path.relative_to(articles_root)
     except ValueError:
-        # fallback: сохраняем в PDF_summaries рядом с pdf (лучше чем падать)
-        return (pdf_path.parent / "PDF_summaries" / pdf_path.with_suffix(".docx").name).resolve()
+        raise RuntimeError(f"PDF is not located under Article Database: {pdf_path}")
 
-    project_root = Path(*parts[:idx])  # .../<project_root>
-    rel_under_articles = Path(*parts[idx + 1 :])  # f1/f2/2025 Title.pdf
-    out = project_root / "PDF_summaries" / rel_under_articles
-    return out.with_suffix(".docx")
+    return (summaries_root / rel).with_suffix(".docx")
 
 
 def _set_text(widget: tk.Text, value: str, *, readonly: bool) -> None:
@@ -367,6 +364,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.tab_results = ttk.Frame(self.nb, padding=0)
         self.tab_discussion = ttk.Frame(self.nb, padding=10)
         self.tab_keypoints = ttk.Frame(self.nb, padding=10)
+        self.tab_abbrev = ttk.Frame(self.nb, padding=10)  # NEW
         self.tab_fig_narr = ttk.Frame(self.nb, padding=10)
 
         self.nb.add(self.tab_intro, text="Introduction")
@@ -374,6 +372,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.nb.add(self.tab_results, text="Results")
         self.nb.add(self.tab_discussion, text="Discussion")
         self.nb.add(self.tab_keypoints, text="Key Points")
+        self.nb.add(self.tab_abbrev, text="Abbreviations")  # NEW
         self.nb.add(self.tab_fig_narr, text="Figure narrative")
 
         # tabs with 2-column alignment (Extracted | Summary)
@@ -393,7 +392,8 @@ class SemiManualSummaryDialog(tk.Toplevel):
             prompt_key="discussion",
             out_widgets=("disc_extracted", "disc_summary", "disc_prompt"),
         )
-        self._build_keypoints_tab()  # no Extracted
+        self._build_keypoints_tab()
+        self._build_abbreviations_tab() 
         self._build_figure_narrative_tab()
 
         # Bottom buttons
@@ -556,6 +556,37 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.results_sections_frame = ttk.Frame(self.results_inner)
         self.results_sections_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
 
+    def _build_abbreviations_tab(self) -> None:
+        """
+        Same concept as Key Points:
+        Row 0: Summary (stretches)
+        Row 1: Copy (fixed)
+        Row 2: Prompt (fixed, max 7 lines)
+        """
+        tab = self.tab_abbrev
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=0)
+        tab.rowconfigure(2, weight=0)
+
+        sum_block = _make_labeled_block(tab, "Summary")
+        sum_block.grid(row=0, column=0, sticky="nsew")
+        sum_block.rowconfigure(1, weight=1)
+        sum_block.columnconfigure(0, weight=1)
+        self.abbrev_summary = _make_text(sum_block, height=10, readonly=False)
+
+        btn_row = ttk.Frame(tab)
+        btn_row.grid(row=1, column=0, sticky="w", pady=(8, 10))
+        ttk.Button(
+            btn_row,
+            text="Copy",
+            command=self._copy_abbrev_prompt_plus_extracted,
+        ).pack(anchor="w")
+
+        pr_block = _make_labeled_block(tab, "Prompt")
+        pr_block.grid(row=2, column=0, sticky="ew")
+        self.abbrev_prompt = _make_text(pr_block, height=7, readonly=False)
+
     def _build_figure_narrative_tab(self) -> None:
         tab = self.tab_fig_narr
         tab.columnconfigure(0, weight=1)
@@ -651,6 +682,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
         _set_text(self.methods_summary, "", readonly=False)
         _set_text(self.disc_summary, "", readonly=False)
         _set_text(self.kp_summary, "", readonly=False)
+        _set_text(self.abbrev_summary, "", readonly=False)  
         _set_text(self.fignarr_summary, "", readonly=False)
 
         # apply prompts with current language
@@ -682,6 +714,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
             self.results_prompt,
             self.disc_prompt,
             self.kp_prompt,
+            self.abbrev_prompt,
             self.fignarr_prompt,
         ]
 
@@ -708,6 +741,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
         _set_text(self.methods_prompt, render(self.prompts_base["methods"]), readonly=False)
         _set_text(self.disc_prompt, render(self.prompts_base["discussion"]), readonly=False)
         _set_text(self.kp_prompt, render(self.prompts_base["key_points"]), readonly=False)
+        _set_text(self.abbrev_prompt, render(self.prompts_base["abbreviations"]), readonly=False) 
         _set_text(self.results_prompt, render(self.prompts_base["results"]), readonly=False)
         _set_text(self.fignarr_prompt, render(self.prompts_base["figure_narrative"]), readonly=False)
 
@@ -902,15 +936,36 @@ class SemiManualSummaryDialog(tk.Toplevel):
         def bind_text(t: tk.Text) -> None:
             t.bind("<<Modified>>", self._on_any_text_modified)
             self._bind_select_all_shortcuts(t)
+            self._bind_paste_refresh(t)  # NEW
+
 
         bind_text(self.intro_summary)
         bind_text(self.methods_summary)
         bind_text(self.disc_summary)
         bind_text(self.fignarr_summary)
         bind_text(self.kp_summary)
+        bind_text(self.abbrev_summary)
 
         for r in self._result_rows:
             bind_text(r.summary_text)
+
+    def _bind_paste_refresh(self, t: tk.Text) -> None:
+        """
+        Ensure word counters refresh immediately after paste.
+        We schedule refresh via after_idle so it runs AFTER Tk inserts clipboard text.
+        """
+        def _after_paste(_evt=None) -> None:
+            try:
+                self.after_idle(self._refresh_all_word_counters)
+            except Exception:
+                pass
+
+        # Virtual event (often fired by Tk)
+        t.bind("<<Paste>>", lambda e: (_after_paste(e), None)[1], add=True)
+
+        # Explicit keybindings (Linux-friendly)
+        t.bind("<Control-v>", lambda e: (_after_paste(e), None)[1], add=True)
+        t.bind("<Control-V>", lambda e: (_after_paste(e), None)[1], add=True)
 
     def _on_any_text_modified(self, event: tk.Event) -> None:
         w = event.widget
@@ -1100,6 +1155,47 @@ class SemiManualSummaryDialog(tk.Toplevel):
         _clipboard_set(self, payload)
         self._refresh_all_word_counters()
 
+    def _copy_abbrev_prompt_plus_extracted(self) -> None:
+        """
+        For abbreviations it's safer to use the full extracted text (not summaries),
+        because abbreviations may not appear in summaries.
+        """
+        prompt = _get_text(self.abbrev_prompt).strip()
+        parts: list[str] = []
+
+        # Introduction / Methods / Discussion extracted
+        if hasattr(self, "intro_extracted"):
+            t = _get_text(self.intro_extracted).strip()
+            if t:
+                parts.append(t)
+        if hasattr(self, "methods_extracted"):
+            t = _get_text(self.methods_extracted).strip()
+            if t:
+                parts.append(t)
+        if hasattr(self, "disc_extracted"):
+            t = _get_text(self.disc_extracted).strip()
+            if t:
+                parts.append(t)
+
+        # Results extracted (all subsections)
+        try:
+            for r in getattr(self, "_result_rows", []):
+                t = _get_text(r.extracted_text).strip()
+                if t:
+                    parts.append(t)
+        except Exception:
+            pass
+
+        # Figure captions extracted
+        if hasattr(self, "figcap_extracted"):
+            t = _get_text(self.figcap_extracted).strip()
+            if t:
+                parts.append(t)
+
+        src = "\n\n".join(parts).strip()
+        payload = (prompt + "\n\n" + src).strip() + "\n"
+        _clipboard_set(self, payload)
+
     def _on_cancel(self) -> None:
         try:
             self.grab_release()
@@ -1128,6 +1224,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
                     ],
                     "discussion": _get_text(self.disc_summary).strip(),
                     "key_points": _get_text(self.kp_summary).strip(),
+                    "abbreviations": _get_text(self.abbrev_summary).strip(),
                     "figure_narrative": _get_text(self.fignarr_summary).strip(),
                 },
                 "prompts_used": {
@@ -1141,29 +1238,6 @@ class SemiManualSummaryDialog(tk.Toplevel):
                 "source_json": str(self.json_path),
                 "source_pdf": str(self.pdf_path) if self.pdf_path else "",
             }
-
-            if self.pdf_path:
-                docx_path = _mirrored_docx_path_from_pdf(self.pdf_path)
-            else:
-                # если pdf_path не передали, fallback как раньше (от json)
-                docx_path = self.json_path.with_suffix(".semi_manual.summary.docx")
-
-            docx_path.parent.mkdir(parents=True, exist_ok=True)
-
-            overwrite = False
-            if docx_path.exists():
-                # Yes=Append, No=Overwrite, Cancel=Abort
-                ans = messagebox.askyesnocancel(
-                    "Summary exists.",
-                    "Summary DOCX already exists. Append?\n"
-                    "YES  = Append\n"
-                    "NO   = Overwrite\n",
-                    default=messagebox.CANCEL,
-                )
-                if ans is None:
-                    return
-                if ans is False:
-                    overwrite = True
 
             # --- choose output docx path ---
             docx_path: Path
@@ -1202,9 +1276,13 @@ class SemiManualSummaryDialog(tk.Toplevel):
                     overwrite = True
             else:
                 # No summary in DB -> mirror from PDF (preferred)
-                if self.pdf_path:
-                    docx_path = _mirrored_docx_path_from_pdf(self.pdf_path)
+                if self.pdf_path and self.db_gateway is not None:
+                    docx_path = _mirrored_docx_path_from_pdf(
+                        project_home=Path(self.db_gateway.project_home),
+                        pdf_path=self.pdf_path,
+                    )
                 else:
+                    # fallback если нет pdf_path или нет db_gateway (нет project_home)
                     docx_path = self.json_path.with_suffix(".semi_manual.summary.docx")
 
                 # Optional: if already exists physically, still ask
