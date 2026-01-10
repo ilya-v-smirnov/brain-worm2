@@ -751,17 +751,6 @@ def append_semi_manual_summary_to_docx(
         _apply_body(p, style)
     _blank(doc, 1)
 
-    # === ABBREVIATIONS ===
-    _heading_h2(doc, "Abbreviations")
-    abbr_text = str(summary.get("abbreviations") or "")
-    abbr_pairs = _parse_abbreviation_pairs(abbr_text)
-    if abbr_pairs:
-        _abbrev_simple_table(doc, abbr_pairs)
-    else:
-        p = doc.add_paragraph("—")
-        _apply_body(p, style)
-    _blank(doc, 1)
-
     # === SECTIONS ===
     def add_h2(name: str) -> None:
         _heading_h2(doc, name)
@@ -810,6 +799,17 @@ def append_semi_manual_summary_to_docx(
 
     add_h2("Figure narrative")
     add_body(str(summary.get("figure_narrative") or ""))
+
+    # === ABBREVIATIONS ===
+    _heading_h2(doc, "Abbreviations")
+    abbr_text = str(summary.get("abbreviations") or "")
+    abbr_pairs = _parse_abbreviation_pairs(abbr_text)
+    if abbr_pairs:
+        _abbrev_simple_table(doc, abbr_pairs)
+    else:
+        p = doc.add_paragraph("—")
+        _apply_body(p, style)
+    _blank(doc, 1)
 
     doc.save(str(docx_path))
 

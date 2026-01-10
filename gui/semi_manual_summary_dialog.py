@@ -364,16 +364,16 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.tab_results = ttk.Frame(self.nb, padding=0)
         self.tab_discussion = ttk.Frame(self.nb, padding=10)
         self.tab_keypoints = ttk.Frame(self.nb, padding=10)
-        self.tab_abbrev = ttk.Frame(self.nb, padding=10)  # NEW
         self.tab_fig_narr = ttk.Frame(self.nb, padding=10)
+        self.tab_abbrev = ttk.Frame(self.nb, padding=10)  
 
         self.nb.add(self.tab_intro, text="Introduction")
         self.nb.add(self.tab_methods, text="Methods")
         self.nb.add(self.tab_results, text="Results")
         self.nb.add(self.tab_discussion, text="Discussion")
         self.nb.add(self.tab_keypoints, text="Key Points")
-        self.nb.add(self.tab_abbrev, text="Abbreviations")  # NEW
         self.nb.add(self.tab_fig_narr, text="Figure narrative")
+        self.nb.add(self.tab_abbrev, text="Abbreviations") 
 
         # tabs with 2-column alignment (Extracted | Summary)
         self._build_two_col_tab(
@@ -1157,44 +1157,13 @@ class SemiManualSummaryDialog(tk.Toplevel):
 
     def _copy_abbrev_prompt_plus_extracted(self) -> None:
         """
-        For abbreviations it's safer to use the full extracted text (not summaries),
-        because abbreviations may not appear in summaries.
+        Abbreviations tab:
+        Copy ONLY the prompt (no sources/extracted).
         """
         prompt = _get_text(self.abbrev_prompt).strip()
-        parts: list[str] = []
-
-        # Introduction / Methods / Discussion extracted
-        if hasattr(self, "intro_extracted"):
-            t = _get_text(self.intro_extracted).strip()
-            if t:
-                parts.append(t)
-        if hasattr(self, "methods_extracted"):
-            t = _get_text(self.methods_extracted).strip()
-            if t:
-                parts.append(t)
-        if hasattr(self, "disc_extracted"):
-            t = _get_text(self.disc_extracted).strip()
-            if t:
-                parts.append(t)
-
-        # Results extracted (all subsections)
-        try:
-            for r in getattr(self, "_result_rows", []):
-                t = _get_text(r.extracted_text).strip()
-                if t:
-                    parts.append(t)
-        except Exception:
-            pass
-
-        # Figure captions extracted
-        if hasattr(self, "figcap_extracted"):
-            t = _get_text(self.figcap_extracted).strip()
-            if t:
-                parts.append(t)
-
-        src = "\n\n".join(parts).strip()
-        payload = (prompt + "\n\n" + src).strip() + "\n"
+        payload = (prompt.strip() + "\n") if prompt else ""
         _clipboard_set(self, payload)
+        self._refresh_all_word_counters()
 
     def _on_cancel(self) -> None:
         try:

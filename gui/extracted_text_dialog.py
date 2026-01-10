@@ -147,8 +147,6 @@ class ExtractedTextDialog(tk.Toplevel):
         self._bind_select_all_shortcuts(self.title_entry)
         self._bind_select_all_shortcuts(self.year_entry)
 
-
-
         self.nb = ttk.Notebook(root)
         self.nb.grid(row=2, column=0, sticky="nsew")
 
