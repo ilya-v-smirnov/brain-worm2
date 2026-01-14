@@ -408,54 +408,36 @@ class ExtractedTextDialog(tk.Toplevel):
     # ---------------- Load/Populate ----------------
 
     def _load_json(self) -> None:
+        """
+        Load JSON into UI.
+        If JSON file is missing: open a blank editor so user can create it.
+        """
         if not self.json_path.exists():
-            messagebox.showerror("Error", f"JSON not found:\n{self.json_path}")
-            self._on_cancel()
+            # Create a blank template; user will fill and Save.
+            blank = {
+                "title": "",
+                "year": "",
+                "introduction": "",
+                "methods": "",
+                "results": [],
+                "discussion": "",
+                "figures": [],
+                "parsing_error": None,
+            }
+            self._populate_from_data(blank)
             return
 
         try:
-            self.original_data = json.loads(self.json_path.read_text(encoding="utf-8"))
+            data = json.loads(self.json_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise TypeError("JSON root must be an object/dict.")
         except Exception as e:
             messagebox.showerror("Error", f"{type(e).__name__}: {e}")
             self._on_cancel()
             return
 
-        self.title_var.set(str(self.original_data.get("title", "") or ""))
-        self.year_var.set(str(self.original_data.get("year", "") or ""))
+        self._populate_from_data(data)
 
-        self._set_text(self.intro_text, str(self.original_data.get("introduction", "") or ""))
-        self._set_text(self.methods_text, str(self.original_data.get("methods", "") or ""))
-        self._set_text(self.discussion_text, str(self.original_data.get("discussion", "") or ""))
-
-        self._clear_results()
-        results = self.original_data.get("results") or []
-        if isinstance(results, list):
-            for item in results:
-                if isinstance(item, dict):
-                    self._add_result_section(
-                        section_title=str(item.get("section_title", "") or ""),
-                        section_text=str(item.get("section_text", "") or ""),
-                    )
-
-        if not self._result_widgets:
-            self._add_result_section()
-
-        self._clear_figures()
-        figures = self.original_data.get("figures") or []
-        if isinstance(figures, list):
-            for item in figures:
-                if isinstance(item, dict):
-                    num = item.get("figure_number", "")
-                    self._add_figure(
-                        figure_number=str(num if num is not None else ""),
-                        caption=str(item.get("caption", "") or ""),
-                    )
-
-        if not self._figure_widgets:
-            self._add_figure()
-
-        self.results_canvas.update_idletasks()
-        self.figures_canvas.update_idletasks()
 
     def _populate_from_data(self, data: dict[str, Any]) -> None:
         """Заполняет UI данными (без записи на диск)."""
@@ -828,13 +810,45 @@ class ExtractedTextDialog(tk.Toplevel):
             )
             return
 
-        ok = messagebox.askyesno(
-            "Extract text again",
-            "Re-extract content from the PDF?",
-            icon="warning"
-        )
-        if not ok:
-            return
+        # Decide whether we need confirmation.
+        # We skip confirmation when there is nothing meaningful to overwrite:
+        #   - JSON file does not exist yet, OR
+        #   - current editor is effectively empty (no user data to lose).
+        def _editor_has_any_content() -> bool:
+            if self.title_var.get().strip():
+                return True
+            if self._get_text(self.intro_text).strip():
+                return True
+            if self._get_text(self.methods_text).strip():
+                return True
+            if self._get_text(self.discussion_text).strip():
+                return True
+
+            for w in self._result_widgets:
+                if w.title_var.get().strip():
+                    return True
+                if self._get_text(w.text).strip():
+                    return True
+
+            for w in self._figure_widgets:
+                if w.number_var.get().strip():
+                    return True
+                if self._get_text(w.caption).strip():
+                    return True
+
+            return False
+
+        need_confirm = self.json_path.exists() and _editor_has_any_content()
+
+        if need_confirm:
+            ok = messagebox.askyesno(
+                "Extract text again",
+                "Re-extract content from the PDF?\n\nCurrent edits in this window will be overwritten.",
+                icon="warning",
+            )
+            if not ok:
+                return
+
         try:
             data = self.parse_pdf_func(self.pdf_path)
             if not isinstance(data, dict):
@@ -842,6 +856,7 @@ class ExtractedTextDialog(tk.Toplevel):
             self._populate_from_data(data)
         except Exception as e:
             messagebox.showerror("Extract text again", f"{type(e).__name__}: {e}")
+
 
     def _copy_json_from_disk(self) -> None:
         if not self.json_path.exists():
@@ -1082,7 +1097,21 @@ class ExtractedTextDialog(tk.Toplevel):
             new_data["results"] = results
             new_data["figures"] = figures
 
+            # Ensure directory exists (important when JSON is created for the first time)
+            try:
+                self.json_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
             self.json_path.write_text(json.dumps(new_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            # Notify parent that JSON exists/updated (e.g., update DB path, refresh tree)
+            if self._on_saved_close:
+                try:
+                    self._on_saved_close()
+                except Exception:
+                    pass
+
 
             if close_after:
                 cb = getattr(self, "_on_saved_close", None)

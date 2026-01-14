@@ -14,8 +14,10 @@ from dbmanager.db_maintenance import (
     delete_single_pdf_path as _delete_single_pdf_path,
     delete_article_everywhere as _delete_article_everywhere,
     parse_pdf_for_article as _parse_pdf_for_article,
-    DeleteReport,
+    reconcile_article_paths as _reconcile_article_paths,
+    set_article_json_path as _set_article_json_path,
 )
+
 
 @dataclass(frozen=True)
 class FileRow:
@@ -40,6 +42,9 @@ class DbGateway:
 
     def sync_article_database(self) -> None:
         _sync_article_database()
+
+    def reconcile_article_paths(self) -> dict[str, int]:
+        return _reconcile_article_paths()
 
     def extract_contents_for_new_articles(self) -> None:
         _extract_contents_for_new_articles()
@@ -113,6 +118,26 @@ class DbGateway:
 
         _set_article_summary_path(article_id, rel_str)
         return rel_str
+    
+    
+    def set_json_path_for_article(self, article_id: int, json_abs_path: Path) -> str:
+        """
+        Сохраняет путь к extracted JSON в БД (Article.json_path).
+
+        В БД пишется путь ОТНОСИТЕЛЬНО project_home, если файл лежит внутри него,
+        иначе пишется абсолютный путь.
+        Возвращает строку, записанную в БД.
+        """
+        json_abs_path = Path(json_abs_path).resolve()
+        try:
+            rel = json_abs_path.relative_to(self.project_home)
+            rel_str = str(rel)
+        except Exception:
+            rel_str = str(json_abs_path)
+
+        _set_article_json_path(article_id, rel_str)
+        return rel_str
+
 
     # ---- Delete / re-extract helpers for GUI ----
 

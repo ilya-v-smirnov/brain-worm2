@@ -132,8 +132,13 @@ class MainWindow:
         self._set_status("Syncing Article Database…")
         self.db.sync_article_database()
 
-        self._set_status("Extracting JSON for new articles…")
-        self.db.extract_contents_for_new_articles()
+        self._set_status("Reconciling JSON/DOCX links…")
+        self.db.reconcile_article_paths()
+
+        # NOTE: intentionally DO NOT auto-generate JSON on startup anymore.
+        # JSON extraction should be user-initiated from "Extracted Text" window.
+        # self._set_status("Extracting JSON for new articles…")
+        # self.db.extract_contents_for_new_articles()
 
         self._set_status("Building tree…")
         self._reload_tree()
@@ -246,8 +251,11 @@ class MainWindow:
         try:
             self._set_status("Syncing Article Database…")
             self.db.sync_article_database()
-            self._set_status("Extracting JSON for new articles…")
-            self.db.extract_contents_for_new_articles()
+
+            # NOTE: intentionally DO NOT auto-generate JSON on refresh anymore.
+            # self._set_status("Extracting JSON for new articles…")
+            # self.db.extract_contents_for_new_articles()
+
             self._set_status("Building tree…")
             self._reload_tree()
             self._set_status("Database updated")
@@ -475,24 +483,47 @@ class MainWindow:
             messagebox.showwarning("View extracted text", "Select an article PDF first.")
             return
 
+        article_id = int(payload["article_id"])
+        pdf_rel = payload.get("pdf_path")
+        if not pdf_rel:
+            messagebox.showerror("View extracted text", "Internal error: PDF path not found in payload.")
+            return
+
+        # Resolve PDF absolute path
+        pdf_path = Path(self.db.resolve_path(pdf_rel))
+
         try:
-            json_rel = self.db.fetch_json_path_for_article(int(payload["article_id"]))
+            json_rel = self.db.fetch_json_path_for_article(article_id)
         except Exception as e:
             messagebox.showerror("View extracted text", f"{type(e).__name__}: {e}")
             return
 
+        # If DB has no json_path yet, use default Contents/<pdf_name>.json
         if not json_rel:
-            messagebox.showwarning("View extracted text", "No extracted JSON for this article yet.")
-            return
+            json_rel = str(Path("Contents") / (Path(pdf_rel).name)).replace(".pdf", ".json")
 
-        json_path = self.db.resolve_path(json_rel)
-        pdf_path = self.db.resolve_path(payload["pdf_path"])
+        json_path = Path(self.db.resolve_path(json_rel))
+
+        def _after_saved() -> None:
+            # Persist json_path into DB (store rel if possible) and refresh UI
+            try:
+                self.db.set_json_path_for_article(article_id, json_path)
+            except Exception:
+                # Even if DB update fails, keep UI alive; user still has the JSON on disk
+                pass
+            try:
+                self._reload_tree()
+            except Exception:
+                pass
+
         ExtractedTextDialog(
             self.master,
             json_path=json_path,
             pdf_path=pdf_path,
             parse_pdf_func=lambda p: self.db.parse_pdf_for_article(str(p)),
+            on_saved_close=_after_saved,
         )
+
 
     def _build_summary_docx_path(self, pdf_rel_or_abs: str) -> Path:
         """Build summary DOCX path.

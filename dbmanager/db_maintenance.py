@@ -345,6 +345,80 @@ def extract_contents_for_new_articles(
     return processed_ids
 
 
+def reconcile_article_paths() -> dict[str, int]:
+    """
+    Восстанавливает отсутствующие ссылки на JSON/DOCX в БД, если файлы физически существуют.
+
+    Логика:
+      - Если Article.json_path пуст: ищем PROJECT_HOME_DIR/Contents/<pdf_basename>.json
+      - Если Article.summary_path пуст: ищем PROJECT_HOME_DIR/PDF_summaries/<pdf_rel_without_article_db>.docx
+        где pdf_rel_without_article_db = pdf_path без ведущего "Article Database/"
+
+    Возвращает счётчики обновлений.
+    """
+    project_home = get_project_home_dir()
+
+    updated_json = 0
+    updated_summary = 0
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                a.id,
+                a.json_path,
+                a.summary_path,
+                af.pdf_path
+            FROM Article a
+            JOIN ArticleFile af ON af.article_id = a.id
+            ORDER BY a.id;
+            """
+        )
+        rows = cur.fetchall()
+
+        for article_id, json_path, summary_path, pdf_path in rows:
+            # --- JSON ---
+            if not json_path:
+                pdf_basename = Path(str(pdf_path)).name  # "... .pdf"
+                json_name = Path(pdf_basename).with_suffix(".json").name
+                json_rel = str(Path("Contents") / json_name)
+                json_abs = project_home / json_rel
+                if json_abs.exists():
+                    cur.execute(
+                        "UPDATE Article SET json_path = ? WHERE id = ?;",
+                        (json_rel, article_id),
+                    )
+                    updated_json += 1
+
+            # --- DOCX summary ---
+            if not summary_path:
+                pdf_rel = Path(str(pdf_path))
+
+                # ожидаем, что в БД pdf_path обычно начинается с "Article Database/..."
+                parts = list(pdf_rel.parts)
+                if len(parts) >= 2 and parts[0] == "Article Database":
+                    stripped = Path(*parts[1:])  # без "Article Database"
+                else:
+                    # fallback: если вдруг pdf_path уже без префикса
+                    stripped = pdf_rel
+
+                docx_rel = Path("PDF_summaries") / stripped.with_suffix(".docx")
+                docx_abs = project_home / docx_rel
+
+                if docx_abs.exists():
+                    cur.execute(
+                        "UPDATE Article SET summary_path = ? WHERE id = ?;",
+                        (str(docx_rel), article_id),
+                    )
+                    updated_summary += 1
+
+        conn.commit()
+
+    return {"updated_json": updated_json, "updated_summary": updated_summary}
+
+
 # ---------- Удаление статей/файлов (для GUI) ----------
 
 @dataclass
@@ -409,6 +483,20 @@ def set_article_summary_path(article_id: int, summary_path: Optional[str]) -> No
         conn.commit()
 
 
+def set_article_json_path(article_id: int, json_path: Optional[str]) -> None:
+    """
+    Записывает путь к extracted JSON в Article.json_path.
+
+    json_path рекомендуется хранить относительным к PROJECT_HOME_DIR.
+    Можно передать None, чтобы очистить поле.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE Article SET json_path = ? WHERE id = ?;",
+            (json_path, article_id),
+        )
+        conn.commit()
 
 
 def _safe_unlink(path: Path, report: DeleteReport) -> None:
