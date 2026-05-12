@@ -6,7 +6,7 @@ from tkinter import ttk
 from typing import Optional
 
 from gui import new_pdfs_adapter as adapter
-from gui.file_ops import open_file
+from gui.file_ops import open_file, open_folder
 
 ORANGE = "#d97706"  # оранжевый шрифт для Already in database
 
@@ -82,10 +82,8 @@ class RenameNewPdfsDialog(tk.Toplevel):
 
     def _open_new_folder(self) -> None:
         try:
-            import subprocess
-
             new_dir = adapter._get_new_dirs()["new"]  # type: ignore[attr-defined]
-            subprocess.Popen(["xdg-open", str(new_dir)])
+            open_folder(new_dir)
         except Exception as e:
             messagebox.showerror("Open folder error", f"{type(e).__name__}: {e}")
 
