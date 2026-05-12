@@ -1,21 +1,15 @@
 from __future__ import annotations
 
-import json
-import subprocess
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
-import threading
 
 
 from gui.db_gateway import DbGateway, FileRow
 from gui.extracted_text_dialog import ExtractedTextDialog
 from gui.file_ops import open_file
 from gui.rename_new_pdfs_dialog import RenameNewPdfsDialog
-from gui.summary_generation_dialog import SummaryGenerationDialog
-from ai_summary.generator import generate_summary
-from docx_utils.docx_writer import append_ai_summary_to_docx
 from gui.semi_manual_summary_dialog import SemiManualSummaryDialog
 
 
@@ -48,18 +42,14 @@ class MainWindow:
         tree_frame = ttk.Frame(root)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 10))
 
-        columns = ("summary", "lecture", "audio")
+        columns = ("summary",)
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", selectmode="browse")
 
         self.tree.heading("#0", text="Article Database")
         self.tree.heading("summary", text="Summary")
-        self.tree.heading("lecture", text="Lecture")
-        self.tree.heading("audio", text="Audio")
 
-        self.tree.column("#0", width=720, stretch=True)
+        self.tree.column("#0", width=900, stretch=True)
         self.tree.column("summary", width=90, anchor=tk.CENTER, stretch=False)
-        self.tree.column("lecture", width=90, anchor=tk.CENTER, stretch=False)
-        self.tree.column("audio", width=90, anchor=tk.CENTER, stretch=False)
 
         yscroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
@@ -70,29 +60,12 @@ class MainWindow:
         bottom = ttk.Frame(root)
         bottom.pack(fill=tk.X, padx=10, pady=8)
 
-        for col in range(3):
-            bottom.columnconfigure(col, weight=1, uniform="bottom_buttons")
-
         self.btn_generate_summary = ttk.Button(
             bottom,
-            text="1. Generate Summary",
+            text="Generate Summary",
             command=lambda: self._on_generate("summary"),
         )
-        self.btn_generate_summary.grid(row=0, column=0, sticky="ew", padx=6)
-
-        self.btn_generate_lecture = ttk.Button(
-            bottom,
-            text="2. Generate Lecture",
-            command=lambda: self._on_generate("lecture"),
-        )
-        self.btn_generate_lecture.grid(row=0, column=1, sticky="ew", padx=6)
-
-        self.btn_generate_audio = ttk.Button(
-            bottom,
-            text="3. Generate Audio",
-            command=lambda: self._on_generate("audio"),
-        )
-        self.btn_generate_audio.grid(row=0, column=2, sticky="ew", padx=6)
+        self.btn_generate_summary.pack(side=tk.LEFT)
 
         self.status_var = tk.StringVar(value="Starting…")
         ttk.Label(root, textvariable=self.status_var, anchor="w").pack(fill=tk.X, pady=(8, 0))
@@ -101,12 +74,11 @@ class MainWindow:
 
         # Context menu (ПКМ)
         self._ctx = tk.Menu(self.master, tearoff=False)
-        # NOTE: актуальный обработчик называется _on_view_extracted_text
         self._ctx.add_command(label="View extracted text", command=self._on_view_extracted_text)
         self._ctx.add_separator()
         self._ctx.add_command(label="Delete…", command=self._ctx_delete_article)
         self.tree.bind("<Button-3>", self._on_right_click)
-        
+
         # Remove old problematic binding (X11: FocusOut fires during tk_popup)
         try:
             self.master.unbind("<FocusOut>")
@@ -121,8 +93,6 @@ class MainWindow:
         self.master.bind("<Deactivate>", self._hide_ctx_menu, add="+")
         self.master.bind("<Unmap>", self._hide_ctx_menu, add="+")
 
-
-
     # ---------------- Startup pipeline ----------------
 
     def _startup_pipeline(self) -> None:
@@ -134,11 +104,6 @@ class MainWindow:
 
         self._set_status("Reconciling JSON/DOCX links…")
         self.db.reconcile_article_paths()
-
-        # NOTE: intentionally DO NOT auto-generate JSON on startup anymore.
-        # JSON extraction should be user-initiated from "Extracted Text" window.
-        # self._set_status("Extracting JSON for new articles…")
-        # self.db.extract_contents_for_new_articles()
 
         self._set_status("Building tree…")
         self._reload_tree()
@@ -199,7 +164,7 @@ class MainWindow:
             if folder_key in folder_iids:
                 return folder_iids[folder_key]
 
-            iid = self.tree.insert(parent_iid, "end", text=name, values=("", "", ""))
+            iid = self.tree.insert(parent_iid, "end", text=name, values=("",))
             self._iid_to_payload[iid] = {"type": "folder", "key": folder_key}
             folder_iids[folder_key] = iid
 
@@ -232,17 +197,13 @@ class MainWindow:
 
         filename = parts[-1]
         summary = CHECK if row.summary_path else DASH
-        lecture = CHECK if row.lecture_text_path else DASH
-        audio = CHECK if row.lecture_audio_path else DASH
 
-        iid = self.tree.insert(parent_iid, "end", text=filename, values=(summary, lecture, audio))
+        iid = self.tree.insert(parent_iid, "end", text=filename, values=(summary,))
         self._iid_to_payload[iid] = {
             "type": "pdf",
             "article_id": row.article_id,
             "pdf_path": row.pdf_path,
             "summary_path": row.summary_path,
-            "lecture_text_path": row.lecture_text_path,
-            "lecture_audio_path": row.lecture_audio_path,
         }
 
     # ---------------- Handlers ----------------
@@ -251,10 +212,6 @@ class MainWindow:
         try:
             self._set_status("Syncing Article Database…")
             self.db.sync_article_database()
-
-            # NOTE: intentionally DO NOT auto-generate JSON on refresh anymore.
-            # self._set_status("Extracting JSON for new articles…")
-            # self.db.extract_contents_for_new_articles()
 
             self._set_status("Building tree…")
             self._reload_tree()
@@ -266,51 +223,6 @@ class MainWindow:
     def _on_rename_new(self) -> None:
         RenameNewPdfsDialog(self.master)
 
-    def _ask_summary_mode(self) -> str | None:
-        """
-        Returns:
-        "auto"  - automated generation
-        "semi"  - semi-manual generation
-        None    - cancel
-        """
-        win = tk.Toplevel(self.master)
-        win.title("Summary Generation")
-        win.resizable(False, False)
-        win.transient(self.master)
-        win.grab_set()
-
-        result: dict[str, str | None] = {"mode": None}
-
-        frm = ttk.Frame(win, padding=12)
-        frm.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(frm, text="Choose summary generation mode:").pack(anchor="w")
-
-        btns = ttk.Frame(frm)
-        btns.pack(fill=tk.X, pady=(10, 0))
-
-        def choose(mode: str | None) -> None:
-            result["mode"] = mode
-            win.destroy()
-
-        ttk.Button(btns, text="Automated generation", command=lambda: choose("auto")).pack(fill=tk.X)
-        ttk.Button(btns, text="Semi-Manual generation", command=lambda: choose("semi")).pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(btns, text="Cancel", command=lambda: choose(None)).pack(fill=tk.X, pady=(6, 0))
-
-        win.protocol("WM_DELETE_WINDOW", lambda: choose(None))
-
-        # center-ish
-        try:
-            win.update_idletasks()
-            x = self.master.winfo_rootx() + 80
-            y = self.master.winfo_rooty() + 80
-            win.geometry(f"+{x}+{y}")
-        except Exception:
-            pass
-
-        self.master.wait_window(win)
-        return result["mode"]
-
     def _on_generate(self, kind: str) -> None:
         payload = self._get_selected_payload()
         if not payload or payload.get("type") != "pdf":
@@ -320,116 +232,39 @@ class MainWindow:
         if kind != "summary":
             messagebox.showinfo("Generate", "Not implemented yet")
             return
-        
-        mode = self._ask_summary_mode()
-        if mode is None:
-            return
-        
-        if mode == "semi":
-            article_id = int(payload["article_id"])
-
-            json_rel = self.db.fetch_json_path_for_article(article_id)
-            if not json_rel:
-                messagebox.showwarning("Semi-Manual Summary", "No extracted JSON for this article yet.")
-                return
-            json_path = Path(self.db.resolve_path(json_rel))
-
-            pdf_rel = payload.get("pdf_path")
-            if not pdf_rel:
-                messagebox.showerror("Semi-Manual Summary", "Internal error: PDF path not found in DB payload.")
-                return
-            pdf_path = Path(self.db.resolve_path(pdf_rel))
-
-            win = SemiManualSummaryDialog(
-                self.master,
-                json_path=json_path,
-                pdf_path=pdf_path,
-                parse_pdf_func=None,
-                db_gateway=self.db,
-                article_id=article_id,
-                existing_summary_path=payload.get("summary_path"),
-            )
-            # After dialog closes, refresh the tree (summary path might have changed)
-            try:
-                self.master.wait_window(win)
-            except Exception:
-                pass
-            self._reload_tree()
-            return
-
-        if mode == "auto":
-            dlg = SummaryGenerationDialog(self.master, default_model="ChatGPT-5.2", default_language="EN")
-            opts = dlg.show()
-            if opts is None:
-                return
 
         article_id = int(payload["article_id"])
-        pdf_path_rel = payload.get("pdf_path")  # то, что в БД (обычно относительное)
-        if not pdf_path_rel:
-            messagebox.showerror("Generate Summary", "Internal error: PDF path not found in DB payload.")
-            return
 
-        out_docx = self._build_summary_docx_path(pdf_path_rel)
-        out_docx.parent.mkdir(parents=True, exist_ok=True)
-
-        self._set_busy(True, "Generating summary…")
-
-        def worker() -> None:
-            try:
-                # 1) read parsed JSON
-                paths = self.db.get_article_paths(article_id)
-                json_rel = paths.get("json_path")
-                if not json_rel:
-                    raise KeyError("json_path is missing for this article in DB (Article.json_path).")
-
-                json_abs = self.db.resolve_path(json_rel)
-                data = json.loads(Path(json_abs).read_text(encoding="utf-8"))
-
-                # 2) generate summary (strategy auto)
-                summary, _usage = generate_summary(
-                    data,
-                    model=opts.model,
-                    language=opts.language,
-                    strategy="auto",
-                    header_defaults={
-                        "source_path": pdf_path_rel,  # путь PDF из БД (зеркалится корректно)
-                    },
-                )
-
-                # 3) write docx (append)
-                append_ai_summary_to_docx(docx_path=out_docx, summary=summary)
-
-                # 4) update DB path (store rel if possible)
-                self.db.set_summary_path_for_article(article_id, out_docx)
-
-                # 5) back to UI thread: reload + open
-                self.master.after(0, lambda: self._on_summary_success(out_docx))
-
-            except ValueError as e:
-                self.master.after(0, lambda err=e: self._on_summary_error(err, is_user_fixable=True))
-            except Exception as e:
-                self.master.after(0, lambda err=e: self._on_summary_error(err, is_user_fixable=False))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-
-    def _on_summary_done(self, out_docx: Path) -> None:
-        self._reload_tree()
-        self._set_busy(False, "Ready")
-        self._open_with_system_app(out_docx)
-
-    def _on_summary_error(self, e: Exception) -> None:
-        self._set_busy(False, "Ready")
-        # Friendly handling for the key expected error
-        if isinstance(e, ValueError) and "No Results subsections" in str(e):
-            messagebox.showerror(
-                "Generate Summary",
-                "Невозможно сгенерировать summary: секция Results пуста или не распознана.\n\n"
-                "Пожалуйста, заполните Results вручную (подразделы Results должны существовать), "
-                "затем попробуйте снова.",
+        json_rel = self.db.fetch_json_path_for_article(article_id)
+        if not json_rel:
+            messagebox.showwarning(
+                "Semi-Manual Summary",
+                "No extracted JSON for this article yet.\n\n"
+                "Use right-click → 'View extracted text' first to create one.",
             )
             return
-        messagebox.showerror("Generate Summary", f"Generation failed:\n{type(e).__name__}: {e}")
+        json_path = Path(self.db.resolve_path(json_rel))
+
+        pdf_rel = payload.get("pdf_path")
+        if not pdf_rel:
+            messagebox.showerror("Semi-Manual Summary", "Internal error: PDF path not found in DB payload.")
+            return
+        pdf_path = Path(self.db.resolve_path(pdf_rel))
+
+        win = SemiManualSummaryDialog(
+            self.master,
+            json_path=json_path,
+            pdf_path=pdf_path,
+            parse_pdf_func=None,
+            db_gateway=self.db,
+            article_id=article_id,
+            existing_summary_path=payload.get("summary_path"),
+        )
+        try:
+            self.master.wait_window(win)
+        except Exception:
+            pass
+        self._reload_tree()
 
     def _on_double_click(self, event: tk.Event) -> None:
         iid = self.tree.focus()
@@ -437,7 +272,7 @@ class MainWindow:
         if not payload or payload.get("type") != "pdf":
             return
 
-        col = self.tree.identify_column(event.x)  # '#0', '#1', '#2', '#3'
+        col = self.tree.identify_column(event.x)  # '#0', '#1'
 
         def open_rel(rel_or_abs: str | None) -> None:
             if not rel_or_abs:
@@ -449,10 +284,6 @@ class MainWindow:
             open_rel(payload.get("pdf_path"))
         elif col == "#1":
             open_rel(payload.get("summary_path"))
-        elif col == "#2":
-            open_rel(payload.get("lecture_text_path"))
-        elif col == "#3":
-            open_rel(payload.get("lecture_audio_path"))
 
     def _on_right_click(self, event: tk.Event) -> None:
         self._hide_ctx_menu()
@@ -520,119 +351,9 @@ class MainWindow:
             self.master,
             json_path=json_path,
             pdf_path=pdf_path,
-            parse_pdf_func=lambda p: self.db.parse_pdf_for_article(str(p)),
+            parse_pdf_func=None,
             on_saved_close=_after_saved,
         )
-
-
-    def _build_summary_docx_path(self, pdf_rel_or_abs: str) -> Path:
-        """Build summary DOCX path.
-
-        Requirement:
-        - Save under PROJECT_HOME_DIR/PDF_summaries
-        - Mirror the folder structure *inside* the Article Database.
-
-        Examples:
-          "Article Database/folder1/folder2/paper.pdf" ->
-          "PDF_summaries/folder1/folder2/paper.docx"  (relative to project home)
-
-          "folder1/folder2/paper.pdf" ->
-          "PDF_summaries/folder1/folder2/paper.docx"  (relative to project home)
-        """
-
-        p = Path(pdf_rel_or_abs)
-        # If absolute, try to make it project-relative
-        if p.is_absolute():
-            try:
-                p = p.relative_to(self.db.project_home)
-            except Exception:
-                # absolute but outside the project -> just mirror its name
-                p = Path(p.name)
-
-        # Strip leading "Article Database" if present
-        if p.parts and p.parts[0] == "Article Database":
-            p_inside = Path(*p.parts[1:])
-        else:
-            p_inside = p
-
-        out = self.db.project_home / "PDF_summaries" / p_inside
-        return out.with_suffix(".docx")
-
-    def _open_with_system_app(self, path: Path) -> None:
-        """
-        Open file using system default application (Ubuntu: xdg-open).
-        Non-blocking.
-        """
-        try:
-            subprocess.Popen(["xdg-open", str(path)])
-        except FileNotFoundError:
-            messagebox.showerror("Open file", "xdg-open not found. Install 'xdg-utils' package.")
-        except Exception as e:
-            messagebox.showerror("Open file", f"Failed to open file:\n{type(e).__name__}: {e}")
-
-    def _on_summary_success(self, out_docx: Path) -> None:
-        self._set_busy(False, "Ready")
-        self._reload_tree()
-        self._open_with_system_app(out_docx)
-
-    def _on_summary_error(self, e: Exception, *, is_user_fixable: bool) -> None:
-        self._set_busy(False, "Ready")
-
-        msg = f"{type(e).__name__}: {e}"
-        if is_user_fixable and "No Results subsections found" in str(e):
-            messagebox.showerror(
-                "Generate Summary",
-                "Results section is empty.\n\n"
-                "Please fill Results subsections manually (in the extracted JSON), then try again.\n\n"
-                f"Details:\n{msg}",
-            )
-            return
-
-        messagebox.showerror(
-            "Generate Summary",
-            "Summary generation failed.\n\n"
-            f"Details:\n{msg}",
-        )
-
-    def _set_busy(self, busy: bool, status_text: str) -> None:
-        self.status_var.set(status_text)
-        state = "disabled" if busy else "normal"
-        for btn in (getattr(self, "btn_generate_summary", None),
-                    getattr(self, "btn_generate_lecture", None),
-                    getattr(self, "btn_generate_audio", None)):
-            if btn is not None:
-                btn.configure(state=state)
-
-        try:
-            self.master.configure(cursor="watch" if busy else "")
-        except Exception:
-            pass
-
-    def _build_summary_docx_path(self, pdf_rel_or_abs: str) -> Path:
-        """
-        Mirrors Article Database PDF path into PROJECT_HOME_DIR/PDF_summaries.
-
-        Examples:
-          "Article Database/f1/f2/A.pdf" -> "<PROJECT_HOME>/PDF_summaries/f1/f2/A.docx"
-          "f1/f2/A.pdf"                 -> "<PROJECT_HOME>/PDF_summaries/f1/f2/A.docx"
-        """
-        project_home = self.db.project_home
-        p = Path(pdf_rel_or_abs)
-
-        # normalize to relative where possible
-        if p.is_absolute():
-            try:
-                p = p.relative_to(project_home)
-            except Exception:
-                # if absolute but not under project_home, we still mirror its tail path
-                p = Path(*p.parts[1:])  # drop root "/"
-
-        parts = list(p.parts)
-        if parts and parts[0] == "Article Database":
-            parts = parts[1:]
-
-        mirrored = Path(*parts).with_suffix(".docx")
-        return project_home / "PDF_summaries" / mirrored
 
     # ---------------- Utils ----------------
 
@@ -641,25 +362,6 @@ class MainWindow:
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
-        self.master.update_idletasks()
-
-    def _set_busy(self, busy: bool, status_text: str) -> None:
-        """Enable/disable main actions and show status."""
-        self._set_status(status_text)
-        state = "disabled" if busy else "normal"
-        # Buttons may not exist during early startup
-        for btn_name in ("btn_generate_summary", "btn_generate_lecture", "btn_generate_audio"):
-            btn = getattr(self, btn_name, None)
-            if btn is not None:
-                try:
-                    btn.configure(state=state)
-                except Exception:
-                    pass
-
-        try:
-            self.master.configure(cursor="watch" if busy else "")
-        except Exception:
-            pass
         self.master.update_idletasks()
 
     def _ctx_delete_article(self):
@@ -698,7 +400,7 @@ class MainWindow:
                 "Это действие удалит:\n"
                 "- все PDF-файлы статьи\n"
                 "- запись статьи из БД\n"
-                "- связанный ИИ-контент (JSON, summary, lecture)\n\n"
+                "- связанный ИИ-контент (JSON, summary)\n\n"
                 "Действие необратимо. Продолжить?",
                 icon="warning",
             )
@@ -778,6 +480,3 @@ class MainWindow:
             self.master.after(100, _tick)
 
         self.master.after(100, _tick)
-
-
-

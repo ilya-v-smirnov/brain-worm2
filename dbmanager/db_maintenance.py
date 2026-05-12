@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass, field
 
 from dbmanager.db_core import get_project_home_dir, get_connection
-from pdfparser.pdf_extract_content import parse_pdf_content
 
 
 # ---------- Общие утилиты для Article Database ----------
@@ -20,14 +18,6 @@ def _get_article_database_root() -> Path:
     """
     project_home = get_project_home_dir()
     return project_home / "Article Database"
-
-
-def _get_contents_dir() -> Path:
-    """
-    Каталог для JSON-файлов с содержимым статей: '<PROJECT_HOME_DIR>/Contents'.
-    """
-    project_home = get_project_home_dir()
-    return project_home / "Contents"
 
 
 def _compute_file_hash(pdf_path: Path, chunk_size: int = 1 << 20) -> str:
@@ -114,6 +104,8 @@ def _insert_new_article(
     Создаёт новую запись в Article и возвращает её id.
 
     json_path, summary_path, lecture_text_path, lecture_audio_path оставляем NULL.
+    (Столбцы lecture_* сохранены в схеме для обратной совместимости со старыми БД,
+    но новая версия приложения их не использует.)
     """
     cur.execute(
         """
@@ -171,7 +163,7 @@ def sync_article_database() -> List[int]:
          - article_id новой статьи добавляем в список для последующей обработки.
 
     Возвращает список article_id статей, которые были добавлены как новые
-    уникальные на этом этапе (для дальнейшей экстракции содержимого на Этапе 3).
+    уникальные на этом этапе.
     """
     project_home = get_project_home_dir()
     article_root = _get_article_database_root()
@@ -219,130 +211,7 @@ def sync_article_database() -> List[int]:
     return new_article_ids
 
 
-# ---------- Этап 3: экстракция содержимого новых статей в JSON ----------
-
-
-def _save_json_file(data: Dict[str, Any], out_path: Path) -> None:
-    """
-    Сохраняет словарь в JSON с ensure_ascii=False и отступами.
-    """
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def extract_contents_for_new_articles(
-    article_ids: Optional[List[int]] = None,
-    limit: Optional[int] = None,
-    *,
-    force: bool = False,
-) -> List[int]:
-    """
-    Этап 3: экстракция содержимого новых статей.
-
-    Берёт статьи из Article, у которых json_path пустой, и для каждой:
-      - читает pdf_master_path (относительно PROJECT_HOME_DIR),
-      - вызывает parse_pdf_content(pdf_path),
-      - сохраняет результат в JSON-файл в '<PROJECT_HOME_DIR>/Contents',
-        имя файла совпадает с именем исходного PDF, но с расширением .json,
-      - обновляет поле json_path в Article.
-
-    Параметры:
-        article_ids:
-            если передан список, обрабатываются только статьи с этими id
-            (и json_path IS NULL/пустой).
-        limit:
-            максимальное количество статей за один вызов (опционально).
-
-    Возвращает список id статей, для которых JSON был создан/обновлён.
-    """
-    project_home = get_project_home_dir()
-    contents_dir = _get_contents_dir()
-    contents_dir.mkdir(parents=True, exist_ok=True)
-
-    processed_ids: List[int] = []
-
-    # Строим запрос к Article
-    params: List[Any] = []
-    where_clauses: List[str] = []
-
-    # По умолчанию берём только статьи без json_path.
-    # При force=True это ограничение снимается ТОЛЬКО если явно переданы article_ids,
-    # чтобы случайно не перезаписать JSON для всей базы.
-    if (not force) or (force and not article_ids):
-        where_clauses.append("(json_path IS NULL OR json_path = '')")
-
-
-    if article_ids:
-        # Если список пуст, просто ничего не делаем
-        placeholders = ", ".join("?" for _ in article_ids)
-        where_clauses.append(f"id IN ({placeholders})")
-        params.extend(article_ids)
-
-    where_sql = " AND ".join(where_clauses)
-    sql = f"SELECT id, pdf_master_path FROM Article WHERE {where_sql}"
-
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(limit)
-
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-
-        for article_id, pdf_rel_path in rows:
-            # pdf_rel_path хранится относительно PROJECT_HOME_DIR
-            pdf_abs_path = project_home / pdf_rel_path
-
-            if not pdf_abs_path.is_file():
-                # Файл физически отсутствует, оставляем json_path пустым.
-                # Это может быть обработано на этапе чистки БД.
-                continue
-
-            # Пытаемся распарсить PDF
-            try:
-                parsed = parse_pdf_content(pdf_abs_path)
-                # Гарантируем, что в результате есть ключ parsing_error
-                parsed.setdefault("parsing_error", None)
-            except Exception as e:
-                # При ошибке парсинга всё равно сохраняем JSON с описанием ошибки
-                parsed = {
-                    "title": "",
-                    "year": "",
-                    "introduction": "",
-                    "methods": "",
-                    "results": [],
-                    "discussion": "",
-                    "figures": [],
-                    "parsing_error": f"parse_pdf_content_error: {type(e).__name__}: {e}",
-                }
-
-            pdf_name = Path(pdf_rel_path).name
-            json_name = Path(pdf_name).with_suffix(".json").name
-            json_rel_path = (contents_dir.name + "/" + json_name)
-            json_abs_path = project_home / json_rel_path
-
-            # --- IMPORTANT: do not overwrite existing extracted JSON automatically ---
-            # Only create it if it does not exist on disk, unless force=True AND explicit article_ids provided.
-            # (Even then, you may want to overwrite only from the "Extracted text" window.)
-            if json_abs_path.exists() and not force:
-                continue
-
-            _save_json_file(parsed, json_abs_path)
-
-
-            # Обновляем Article.json_path относительным путём
-            cur.execute(
-                "UPDATE Article SET json_path = ? WHERE id = ?;",
-                (json_rel_path, article_id),
-            )
-
-            processed_ids.append(article_id)
-
-        conn.commit()
-
-    return processed_ids
+# ---------- Reconciliation ссылок JSON / DOCX ----------
 
 
 def reconcile_article_paths() -> dict[str, int]:
@@ -466,10 +335,9 @@ def get_article_paths(article_id: int) -> Dict[str, Optional[str]]:
         }
 
 
-
 def set_article_summary_path(article_id: int, summary_path: Optional[str]) -> None:
     """
-    Записывает путь к docx с AI-summary в Article.summary_path.
+    Записывает путь к docx с summary в Article.summary_path.
 
     summary_path рекомендуется хранить относительным к PROJECT_HOME_DIR.
     Можно передать None, чтобы очистить поле.
@@ -577,6 +445,8 @@ def delete_article_everywhere(
 
     ai_candidates: list[str] = []
     if delete_ai_files:
+        # lecture_* поля сохраняются в схеме БД, но в новой версии не используются;
+        # если в старой БД они заполнены — удаляем заодно.
         for k in ("json_path", "summary_path", "lecture_text_path", "lecture_audio_path"):
             v = paths.get(k)
             if v:
@@ -601,23 +471,3 @@ def delete_article_everywhere(
             _safe_unlink(abs_path, report)
 
     return report
-
-# ---------- Повторный парсинг (без сохранения) ----------
-
-def parse_pdf_for_article(pdf_abs_path: Path) -> Dict[str, Any]:
-    """Парсит PDF и возвращает структуру как для JSON, но НЕ сохраняет на диск."""
-    try:
-        parsed = parse_pdf_content(pdf_abs_path)
-        parsed.setdefault("parsing_error", None)
-        return parsed
-    except Exception as e:
-        return {
-            "title": "",
-            "year": "",
-            "introduction": "",
-            "methods": "",
-            "results": [],
-            "discussion": "",
-            "figures": [],
-            "parsing_error": f"parse_pdf_content_error: {type(e).__name__}: {e}",
-        }

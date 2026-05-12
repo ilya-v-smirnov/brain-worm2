@@ -6,14 +6,13 @@ from pathlib import Path
 
 from dbmanager.db_core import get_project_home_dir, init_db_schema as _init_db_schema
 from dbmanager.db_maintenance import (
+    DeleteReport,
     sync_article_database as _sync_article_database,
-    extract_contents_for_new_articles as _extract_contents_for_new_articles,
     list_article_pdf_paths as _list_article_pdf_paths,
     get_article_paths as _get_article_paths,
     set_article_summary_path as _set_article_summary_path,
     delete_single_pdf_path as _delete_single_pdf_path,
     delete_article_everywhere as _delete_article_everywhere,
-    parse_pdf_for_article as _parse_pdf_for_article,
     reconcile_article_paths as _reconcile_article_paths,
     set_article_json_path as _set_article_json_path,
 )
@@ -24,12 +23,10 @@ class FileRow:
     article_id: int
     pdf_path: str
     summary_path: str | None
-    lecture_text_path: str | None
-    lecture_audio_path: str | None
 
 
 class DbGateway:
-    """Тонкая прослойка GUI -> backend (по требованиям ТЗ)."""
+    """Тонкая прослойка GUI -> backend."""
 
     def __init__(self) -> None:
         self.project_home: Path = get_project_home_dir()
@@ -46,9 +43,6 @@ class DbGateway:
     def reconcile_article_paths(self) -> dict[str, int]:
         return _reconcile_article_paths()
 
-    def extract_contents_for_new_articles(self) -> None:
-        _extract_contents_for_new_articles()
-
     # ---- Read operations ----
 
     def fetch_file_rows(self) -> list[FileRow]:
@@ -63,9 +57,7 @@ class DbGateway:
                 SELECT
                     af.article_id,
                     af.pdf_path,
-                    a.summary_path,
-                    a.lecture_text_path,
-                    a.lecture_audio_path
+                    a.summary_path
                 FROM ArticleFile af
                 JOIN Article a ON a.id = af.article_id
                 ORDER BY af.pdf_path ASC;
@@ -78,8 +70,6 @@ class DbGateway:
                         article_id=int(r[0]),
                         pdf_path=str(r[1]),
                         summary_path=r[2],
-                        lecture_text_path=r[3],
-                        lecture_audio_path=r[4],
                     )
                 )
             return out
@@ -118,8 +108,8 @@ class DbGateway:
 
         _set_article_summary_path(article_id, rel_str)
         return rel_str
-    
-    
+
+
     def set_json_path_for_article(self, article_id: int, json_abs_path: Path) -> str:
         """
         Сохраняет путь к extracted JSON в БД (Article.json_path).
@@ -139,7 +129,7 @@ class DbGateway:
         return rel_str
 
 
-    # ---- Delete / re-extract helpers for GUI ----
+    # ---- Delete helpers for GUI ----
 
     def list_article_pdf_paths(self, article_id: int) -> list[str]:
         return _list_article_pdf_paths(article_id)
@@ -172,10 +162,6 @@ class DbGateway:
             delete_physical_pdfs=delete_physical_pdfs,
             delete_ai_files=delete_ai_files,
         )
-
-    def parse_pdf_for_article(self, pdf_rel_or_abs: str) -> dict:
-        pdf_abs = self.resolve_path(pdf_rel_or_abs)
-        return _parse_pdf_for_article(pdf_abs)
 
     def resolve_path(self, rel_or_abs: str) -> Path:
         """
