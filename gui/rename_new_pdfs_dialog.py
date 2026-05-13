@@ -7,6 +7,7 @@ from typing import Optional
 
 from gui import new_pdfs_adapter as adapter
 from gui.file_ops import open_file, open_folder
+from dbmanager.new_manager import sanitize_title_for_filename
 
 ORANGE = "#d97706"  # оранжевый шрифт для Already in database
 
@@ -118,6 +119,17 @@ class RenameNewPdfsDialog(tk.Toplevel):
         year_s = str(year_s).strip()
         title_s = str(title_s).strip()
 
+        # --- Санитизация title для имени файла ---
+        # Удаляем из title все символы, недопустимые в имени файла на Windows
+        # (< > : " / \ | ? *), а также управляющие символы и хвостовые точки.
+        # Если значение изменилось — сразу обновляем ячейку, чтобы пользователь видел
+        # результат после нажатия Enter / потери фокуса полем редактирования.
+        if title_s:
+            sanitized = sanitize_title_for_filename(title_s)
+            if sanitized != title_s:
+                title_s = sanitized
+                self.tree.set(iid, "title", title_s)
+
         # parse year
         year: Optional[int] = None
         if year_s != "":
@@ -187,6 +199,8 @@ class RenameNewPdfsDialog(tk.Toplevel):
             new_val = entry.get()
             self.tree.set(iid, key, new_val)
             entry.destroy()
+            # Санитизация и обновление ячейки происходит внутри _update_item_from_row,
+            # который вызывается из _update_summary.
             self._update_summary()
 
         entry.bind("<Return>", commit)
