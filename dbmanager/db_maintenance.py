@@ -191,8 +191,16 @@ def sync_article_database() -> List[int]:
             article_id = _get_article_id_by_hash(cur, file_hash)
 
             if article_id is None:
-                # Случай B — новой уникальной статьи в Article ещё нет
-                year, title = _parse_year_and_title_from_filename(pdf_path.name)
+                # Случай B — новой уникальной статьи в Article ещё нет.
+                # Имя может не соответствовать формату '<Year> <Title>.pdf' — например,
+                # это статья, скачанная издателем как 'fimmu-09-01325.pdf'.
+                # Не падаем: вставляем с year=0 и title=basename, а в GUI такие
+                # файлы будут подсвечены красным (как «требуют переименования»).
+                try:
+                    year, title = _parse_year_and_title_from_filename(pdf_path.name)
+                except ValueError:
+                    year = 0
+                    title = Path(pdf_path.name).stem.strip() or "untitled"
 
                 article_id = _insert_new_article(
                     cur=cur,

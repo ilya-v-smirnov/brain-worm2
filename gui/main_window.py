@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
@@ -15,6 +16,18 @@ from gui.semi_manual_summary_dialog import SemiManualSummaryDialog
 
 CHECK = "✓"
 DASH = "-"
+
+# Имя соответствует формату "<Year> <Title>.pdf", если выполняются:
+#   - первые 4 символа — 4-значный год
+#   - сразу за ним идёт пробел
+#   - дальше — непустое имя
+# Файлы, не соответствующие шаблону, подсвечиваются красным в дереве.
+_GOOD_FILENAME_RE = re.compile(r"^\d{4} .+\.pdf$", re.IGNORECASE)
+
+
+def _is_well_named(filename: str) -> bool:
+    """True если имя соответствует ожидаемому формату '<Year> <Title>.pdf'."""
+    return bool(_GOOD_FILENAME_RE.match(filename))
 
 
 class MainWindow:
@@ -50,6 +63,9 @@ class MainWindow:
 
         self.tree.column("#0", width=900, stretch=True)
         self.tree.column("summary", width=90, anchor=tk.CENTER, stretch=False)
+
+        # Подсветка строк с именами, не соответствующими формату '<Year> <Title>.pdf'
+        self.tree.tag_configure("malformed", foreground="#c0392b")
 
         yscroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
@@ -198,7 +214,11 @@ class MainWindow:
         filename = parts[-1]
         summary = CHECK if row.summary_path else DASH
 
-        iid = self.tree.insert(parent_iid, "end", text=filename, values=(summary,))
+        # Файлы с именем, не соответствующим формату '<Year> <Title>.pdf',
+        # подсвечиваем красным — пользователь видит, что их нужно переименовать.
+        tags = () if _is_well_named(filename) else ("malformed",)
+
+        iid = self.tree.insert(parent_iid, "end", text=filename, values=(summary,), tags=tags)
         self._iid_to_payload[iid] = {
             "type": "pdf",
             "article_id": row.article_id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -14,6 +15,58 @@ from gui.main_window import MainWindow
 
 ARTICLE_DB_FOLDER_NAME = "Article Database"
 NEW_FOLDER_NAME = "!New"
+
+# Базовый шрифт UI. На Windows и в большинстве современных Office-style
+# окружений ставится Calibri (стандарт). На системах, где Calibri нет
+# (например, чистый Linux без Microsoft-fonts), оставим системные дефолты,
+# чтобы интерфейс не «поплыл».
+PREFERRED_UI_FAMILY = "Calibri"
+UI_FONT_SIZE = 10           # для Entry / Label / Treeview
+TEXT_FONT_SIZE = 11         # для tk.Text (более крупный, для удобства чтения)
+
+
+# ---------------- Global font setup ----------------
+
+
+def _setup_global_fonts() -> None:
+    """
+    Переопределяет именованные шрифты Tk, которые виджеты используют
+    по умолчанию. Срабатывает один раз при старте приложения, влияет
+    на ВСЕ окна и диалоги.
+
+    - TkDefaultFont — основа для ttk.Entry, ttk.Label, ttk.Treeview, ttk.Button
+    - TkTextFont    — основа для tk.Text (Linux/macOS)
+    - TkFixedFont   — основа для tk.Text (Windows) и других monospace-полей
+
+    Если Calibri в системе нет — функция тихо ничего не делает.
+    """
+    try:
+        available = set(tkfont.families())
+    except tk.TclError:
+        return
+
+    if PREFERRED_UI_FAMILY not in available:
+        return
+
+    targets = [
+        ("TkDefaultFont", UI_FONT_SIZE),
+        ("TkTextFont", TEXT_FONT_SIZE),
+        ("TkFixedFont", TEXT_FONT_SIZE),
+    ]
+
+    for name, size in targets:
+        try:
+            tkfont.nametofont(name).configure(
+                family=PREFERRED_UI_FAMILY,
+                size=size,
+            )
+        except tk.TclError:
+            # На некоторых сборках Tk какой-то из именованных шрифтов
+            # может отсутствовать — это не критично.
+            continue
+
+
+# ---------------- First-run wizard ----------------
 
 
 def _ensure_article_db_structure(project_home: Path) -> None:
@@ -122,7 +175,6 @@ def _run_first_run_wizard(root: tk.Tk) -> bool:
 
         project_home = _resolve_project_home(Path(chosen_str))
         if project_home is None:
-            # Пользователь сказал "нет" одному из подтверждений — пусть выбирает заново
             continue
 
         try:
@@ -157,11 +209,17 @@ def _run_first_run_wizard(root: tk.Tk) -> bool:
         return True
 
 
+# ---------------- Entry point ----------------
+
+
 def main() -> None:
     root = tk.Tk()
     root.title("Brain Worm")
 
-    # First-run check: if no settings.json found anywhere, ask the user.
+    # Глобальная настройка шрифтов — обязательно после tk.Tk() и до любых виджетов.
+    _setup_global_fonts()
+
+    # First-run check: если нет settings.json — запустить wizard
     if find_settings_path() is None:
         if not _run_first_run_wizard(root):
             root.destroy()
