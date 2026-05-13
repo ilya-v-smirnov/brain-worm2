@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from gui.file_ops import open_file
 from docx_utils.docx_writer import export_extracted_text_to_docx
+from md_utils.md_writer import export_extracted_text_to_md
 from gui.find_replace_dialog import FindReplaceDialog, FindReplaceState
 
 
@@ -112,6 +113,7 @@ class ExtractedTextDialog(tk.Toplevel):
         ttk.Button(actions, text="Copy text", command=self._copy_text_from_disk).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Copy JSON", command=self._copy_json_from_disk).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Export to docx", command=self._export_to_docx).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text="Export to MD", command=self._export_to_md).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Open PDF", command=self._on_open_pdf).pack(side=tk.LEFT)
 
         options = ttk.Frame(header)
@@ -845,6 +847,40 @@ class ExtractedTextDialog(tk.Toplevel):
             )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export docx:\n{e}")
+            return
+
+
+    def _export_to_md(self) -> None:
+        try:
+            raw = self.json_path.read_text(encoding="utf-8")
+            obj = json.loads(raw)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read JSON:\n{e}")
+            return
+
+        obj = self._apply_export_filters(obj)
+
+        default_name = (str(obj.get("title") or "article").strip() or "article")
+        default_name = "".join(ch if ch.isalnum() or ch in " _-." else "_" for ch in default_name)[:80]
+
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export to Markdown",
+            defaultextension=".md",
+            initialfile=f"{default_name}.md",
+            filetypes=[("Markdown file", "*.md"), ("Text file", "*.txt")],
+        )
+        if not path:
+            return
+
+        try:
+            export_extracted_text_to_md(
+                md_path=Path(path),
+                article=obj,
+                source_path=str(self.pdf_path or self.json_path),
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export Markdown:\n{e}")
             return
 
 

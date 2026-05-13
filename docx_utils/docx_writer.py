@@ -436,7 +436,9 @@ def export_extracted_text_to_docx(
             if not isinstance(fig, dict):
                 continue
             num = str(fig.get("figure_number") or "").strip()
-            cap = str(fig.get("figure_caption") or "").strip()
+            # В JSON ключ называется "caption" (см. extracted_text_dialog.py:
+            # figures.append({"figure_number": ..., "caption": ...})).
+            cap = str(fig.get("caption") or "").strip()
             if not (num or cap):
                 continue
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox
 from tkinter import ttk
-from typing import Any
+from typing import Any, Callable
 
 from gui.file_ops import open_file  # :contentReference[oaicite:2]{index=2}
 from gui.extracted_text_dialog import ExtractedTextDialog  # :contentReference[oaicite:3]{index=3}
@@ -16,6 +16,11 @@ from docx_utils.docx_writer import append_semi_manual_summary_to_docx
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from gui.db_gateway import DbGateway
+
+
+# Шрифт многострочных текстовых полей.
+# Calibri — Windows-стандарт; на других ОС tkinter тихо подставит дефолтный sans-serif.
+TEXT_FONT = ("Calibri", 11)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -127,7 +132,7 @@ def _make_text(
     box.rowconfigure(0, weight=1)
     box.columnconfigure(0, weight=1)
 
-    txt = tk.Text(box, wrap="word", height=height)
+    txt = tk.Text(box, wrap="word", height=height, font=TEXT_FONT)
     scr = ttk.Scrollbar(box, orient=tk.VERTICAL, command=txt.yview)
     txt.configure(yscrollcommand=scr.set)
 
@@ -211,6 +216,7 @@ class SemiManualSummaryDialog(tk.Toplevel):
         db_gateway: "DbGateway | None" = None,
         article_id: int | None = None,
         existing_summary_path: str | None = None,
+        on_request_edit: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master)
         self.title("Semi-Manual Summary Generation")
@@ -237,6 +243,11 @@ class SemiManualSummaryDialog(tk.Toplevel):
         self.article_id = article_id
 
         self.existing_summary_path = existing_summary_path
+
+        # Pipeline mode: если задан, нажатие "Edit extracted text" не открывает
+        # ExtractedTextDialog поверх, а закрывает текущее окно и зовёт callback —
+        # main_window использует это, чтобы перезапустить цепочку Extracted -> Semi-Manual.
+        self._on_request_edit = on_request_edit
 
         self.data: dict[str, Any] = {}
 
@@ -1027,6 +1038,30 @@ class SemiManualSummaryDialog(tk.Toplevel):
     # ---------------- Actions ----------------
 
     def _on_edit_extracted_text(self) -> None:
+        # Pipeline mode: закрыть текущее окно и передать управление в main_window,
+        # который перезапустит цепочку Extracted Text -> (Save & Continue) -> Semi-Manual.
+        if self._on_request_edit is not None:
+            cb = self._on_request_edit
+            parent = self.master
+
+            try:
+                self.grab_release()
+            except Exception:
+                pass
+            self.destroy()
+
+            try:
+                if parent is not None and hasattr(parent, "after"):
+                    parent.after(0, cb)
+                else:
+                    cb()
+            except Exception:
+                pass
+            return
+
+        # Standalone mode: ExtractedText открывается ПОВЕРХ текущего Semi-Manual,
+        # как было раньше. Используется, если Semi-Manual открыли иначе, чем через
+        # pipeline (на будущее — сейчас все точки входа задают on_request_edit).
         ExtractedTextDialog(
             self,
             json_path=self.json_path,

@@ -306,13 +306,16 @@ class MainWindow:
                 self._reload_tree()
             except Exception:
                 pass
-            # Шаг 2: при continue_to_summary открываем Semi-Manual Summary
+            # Шаг 2: при continue_to_summary открываем Semi-Manual Summary.
+            # Передаём ему payload, чтобы кнопка "Edit extracted text" внутри
+            # могла перезапустить эту же цепочку.
             if continue_to_summary:
                 self._open_semi_manual_summary(
                     article_id=article_id,
                     json_path=json_path,
                     pdf_path=pdf_path,
                     existing_summary_path=existing_summary_path,
+                    edit_payload=payload,
                 )
 
         ExtractedTextDialog(
@@ -330,7 +333,19 @@ class MainWindow:
         json_path: Path,
         pdf_path: Path,
         existing_summary_path: str | None,
+        edit_payload: dict | None = None,
     ) -> None:
+        # Если задан edit_payload — в окно Semi-Manual прокидывается callback,
+        # который при нажатии "Edit extracted text" закроет это окно и снова
+        # откроет Extracted Text с режимом Save & Continue (а после повторного
+        # сохранения — новый Semi-Manual). Так цепочка закольцовывается без
+        # вложенных модалок.
+        on_request_edit = None
+        if edit_payload is not None:
+            def _re_enter_pipeline() -> None:
+                self._open_extracted_text_for(edit_payload, continue_to_summary=True)
+            on_request_edit = _re_enter_pipeline
+
         win = SemiManualSummaryDialog(
             self.master,
             json_path=json_path,
@@ -338,6 +353,7 @@ class MainWindow:
             db_gateway=self.db,
             article_id=article_id,
             existing_summary_path=existing_summary_path,
+            on_request_edit=on_request_edit,
         )
         try:
             self.master.wait_window(win)
