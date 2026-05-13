@@ -94,30 +94,40 @@ def _compute_file_hash(pdf_path: Path, chunk_size: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def _sanitize_title_for_filename(title: str, max_len: int = 150) -> str:
+def sanitize_title_for_filename(title: str, max_len: int = 150) -> str:
     """
     Делает title безопасным для использования в имени файла.
     Убирает/заменяет проблемные символы, обрезает длину.
+
+    Список запрещённых символов учитывает ограничения Windows
+    (более строгие, чем Linux/macOS).
     """
-    # Заменяем запрещённые для файловой системы символы
+    # Заменяем запрещённые для файловой системы символы:
+    # < > : " / \ | ? *  — запрещены в Windows
     prohibited = '<>:"/\\|?*'
     sanitized = "".join("_" if c in prohibited else c for c in title)
 
     # Убираем управляющие и неотображаемые символы
     sanitized = "".join(c for c in sanitized if c.isprintable())
 
-    sanitized = sanitized.strip()
+    # Windows также не любит, когда имя заканчивается точкой или пробелом
+    sanitized = sanitized.strip().rstrip(".")
+
     if len(sanitized) > max_len:
-        sanitized = sanitized[:max_len].rstrip()
+        sanitized = sanitized[:max_len].rstrip().rstrip(".")
 
     return sanitized
+
+
+# Сохраняем старое имя как алиас на случай, если где-то остался импорт
+_sanitize_title_for_filename = sanitize_title_for_filename
 
 
 def _build_new_filename(year: int, title: str) -> str:
     """
     Формирует имя файла в формате "<Year> <Title>.pdf".
     """
-    safe_title = _sanitize_title_for_filename(title)
+    safe_title = sanitize_title_for_filename(title)
     if not safe_title:
         raise ValueError("Cannot build filename: sanitized title is empty.")
     return f"{year} {safe_title}.pdf"
@@ -160,7 +170,7 @@ def process_new_pdf_file(pdf_path: Path) -> NewPdfResult:
 
     Логика:
         1. Проверка читаемости PDF.
-        2. Вызов extract_title_and_year.
+        2. Вызов extract_title_and_year (через pypdf).
         3. При проблемах (повреждён, не определены год/название) —
            перенос в !New/Manual review.
         4. Для корректных файлов:
@@ -197,7 +207,6 @@ def process_new_pdf_file(pdf_path: Path) -> NewPdfResult:
     try:
         info = extract_title_and_year(
             pdf_path=pdf_path,
-            use_llm_fallback=True,
             print_result=False,
         )
     except Exception as e:  # на всякий случай, чтобы не падать на одном файле

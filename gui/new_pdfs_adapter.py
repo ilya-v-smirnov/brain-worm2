@@ -85,7 +85,6 @@ def analyze_new_pdfs_for_gui() -> list[NewPdfItem]:
                 try:
                     info = extract_title_and_year(
                         pdf_path=pdf_path,
-                        use_llm_fallback=True,
                         print_result=False,
                     )
                 except Exception as e:
@@ -140,6 +139,8 @@ def analyze_new_pdfs_for_gui() -> list[NewPdfItem]:
             )
 
     return items
+
+
 @dataclass
 class ApplySummary:
     moved_renamed: int = 0
