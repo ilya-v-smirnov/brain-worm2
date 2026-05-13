@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox
 from tkinter import ttk
-from typing import Any, Callable
+from typing import Any
 
 from gui.file_ops import open_file  # :contentReference[oaicite:2]{index=2}
 from gui.extracted_text_dialog import ExtractedTextDialog  # :contentReference[oaicite:3]{index=3}
@@ -207,7 +207,6 @@ class SemiManualSummaryDialog(tk.Toplevel):
         *,
         json_path: Path,
         pdf_path: Path | None = None,
-        parse_pdf_func: Callable[[Path], dict[str, Any]] | None = None,
         prompts: dict[str, str] | None = None,
         db_gateway: "DbGateway | None" = None,
         article_id: int | None = None,
@@ -233,7 +232,6 @@ class SemiManualSummaryDialog(tk.Toplevel):
 
         self.json_path = json_path
         self.pdf_path = pdf_path
-        self.parse_pdf_func = parse_pdf_func
 
         self.db_gateway = db_gateway
         self.article_id = article_id
@@ -1033,7 +1031,6 @@ class SemiManualSummaryDialog(tk.Toplevel):
             self,
             json_path=self.json_path,
             pdf_path=self.pdf_path,
-            parse_pdf_func=self.parse_pdf_func,
             on_saved_close=self._on_extracted_saved_close,
         )
 

@@ -255,7 +255,6 @@ class MainWindow:
             self.master,
             json_path=json_path,
             pdf_path=pdf_path,
-            parse_pdf_func=None,
             db_gateway=self.db,
             article_id=article_id,
             existing_summary_path=payload.get("summary_path"),
@@ -351,7 +350,6 @@ class MainWindow:
             self.master,
             json_path=json_path,
             pdf_path=pdf_path,
-            parse_pdf_func=None,
             on_saved_close=_after_saved,
         )
 

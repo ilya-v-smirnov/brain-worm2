@@ -46,7 +46,6 @@ class ExtractedTextDialog(tk.Toplevel):
         *,
         json_path: Path,
         pdf_path: Path | None = None,
-        parse_pdf_func: Callable[[Path], dict[str, Any]] | None = None,
         on_saved_close: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master)
@@ -66,7 +65,6 @@ class ExtractedTextDialog(tk.Toplevel):
 
         self.json_path = json_path
         self.pdf_path = pdf_path
-        self.parse_pdf_func = parse_pdf_func
 
         self._on_saved_close = on_saved_close
         self._notify_parent = master
@@ -104,7 +102,6 @@ class ExtractedTextDialog(tk.Toplevel):
         actions = ttk.Frame(header)
         actions.grid(row=0, column=1, sticky="e")
 
-        ttk.Button(actions, text="Extract text again", command=self._on_extract_text_again).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Copy text", command=self._copy_text_from_disk).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Copy JSON", command=self._copy_json_from_disk).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Export to docx", command=self._export_to_docx).pack(side=tk.LEFT, padx=(0, 6))
@@ -793,69 +790,6 @@ class ExtractedTextDialog(tk.Toplevel):
             messagebox.showinfo("Open PDF", "PDF path is not available.")
             return
         open_file(self.pdf_path)
-
-    def _on_extract_text_again(self) -> None:
-        if not self.pdf_path:
-            messagebox.showinfo("Extract text again", "PDF path is not available.")
-            return
-
-        if not self.pdf_path.exists():
-            messagebox.showerror("Extract text again", f"PDF not found:\n{self.pdf_path}")
-            return
-
-        if not self.parse_pdf_func:
-            messagebox.showerror(
-                "Extract text again",
-                "Parsing function is not available (parse_pdf_func is None).",
-            )
-            return
-
-        # Decide whether we need confirmation.
-        # We skip confirmation when there is nothing meaningful to overwrite:
-        #   - JSON file does not exist yet, OR
-        #   - current editor is effectively empty (no user data to lose).
-        def _editor_has_any_content() -> bool:
-            if self.title_var.get().strip():
-                return True
-            if self._get_text(self.intro_text).strip():
-                return True
-            if self._get_text(self.methods_text).strip():
-                return True
-            if self._get_text(self.discussion_text).strip():
-                return True
-
-            for w in self._result_widgets:
-                if w.title_var.get().strip():
-                    return True
-                if self._get_text(w.text).strip():
-                    return True
-
-            for w in self._figure_widgets:
-                if w.number_var.get().strip():
-                    return True
-                if self._get_text(w.caption).strip():
-                    return True
-
-            return False
-
-        need_confirm = self.json_path.exists() and _editor_has_any_content()
-
-        if need_confirm:
-            ok = messagebox.askyesno(
-                "Extract text again",
-                "Re-extract content from the PDF?\n\nCurrent edits in this window will be overwritten.",
-                icon="warning",
-            )
-            if not ok:
-                return
-
-        try:
-            data = self.parse_pdf_func(self.pdf_path)
-            if not isinstance(data, dict):
-                raise TypeError("parse_pdf_func must return dict")
-            self._populate_from_data(data)
-        except Exception as e:
-            messagebox.showerror("Extract text again", f"{type(e).__name__}: {e}")
 
 
     def _copy_json_from_disk(self) -> None:
