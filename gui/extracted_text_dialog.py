@@ -14,6 +14,11 @@ from docx_utils.docx_writer import export_extracted_text_to_docx
 from gui.find_replace_dialog import FindReplaceDialog, FindReplaceState
 
 
+# Шрифт многострочных текстовых полей.
+# Calibri — Windows-стандарт; на других ОС tkinter тихо подставит дефолтный sans-serif.
+TEXT_FONT = ("Calibri", 11)
+
+
 @dataclass
 class _ResultSectionWidgets:
     frame: ttk.Frame
@@ -47,6 +52,7 @@ class ExtractedTextDialog(tk.Toplevel):
         json_path: Path,
         pdf_path: Path | None = None,
         on_saved_close: Callable[[], None] | None = None,
+        continue_to_summary: bool = False,
     ) -> None:
         super().__init__(master)
         self.title("Extracted Text")
@@ -67,6 +73,7 @@ class ExtractedTextDialog(tk.Toplevel):
         self.pdf_path = pdf_path
 
         self._on_saved_close = on_saved_close
+        self._continue_to_summary = bool(continue_to_summary)
         self._notify_parent = master
 
         self.original_data: dict = {}
@@ -190,7 +197,8 @@ class ExtractedTextDialog(tk.Toplevel):
         bottom.columnconfigure(0, weight=1)
 
         ttk.Button(bottom, text="Cancel", command=self._on_cancel).grid(row=0, column=3, sticky="e")
-        ttk.Button(bottom, text="Save & Close", command=self._on_save_and_close).grid(row=0, column=2, sticky="e", padx=(0, 10))
+        save_close_text = "Save & Continue" if self._continue_to_summary else "Save & Close"
+        ttk.Button(bottom, text=save_close_text, command=self._on_save_and_close).grid(row=0, column=2, sticky="e", padx=(0, 10))
         ttk.Button(bottom, text="Save", command=self._on_save).grid(row=0, column=1, sticky="e", padx=(0, 10))
 
     def _text_area(self, parent: ttk.Frame) -> tk.Text:
@@ -202,7 +210,7 @@ class ExtractedTextDialog(tk.Toplevel):
         box.columnconfigure(0, weight=1)
         box.rowconfigure(0, weight=1)
 
-        txt = tk.Text(box, wrap="word")
+        txt = tk.Text(box, wrap="word", font=TEXT_FONT)
         scr = ttk.Scrollbar(box, orient=tk.VERTICAL, command=txt.yview)
         txt.configure(yscrollcommand=scr.set)
 
@@ -625,7 +633,7 @@ class ExtractedTextDialog(tk.Toplevel):
         title_entry = ttk.Entry(left, textvariable=title_var)
         title_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
-        txt = tk.Text(left, wrap="word", height=9)
+        txt = tk.Text(left, wrap="word", height=9, font=TEXT_FONT)
         scr = ttk.Scrollbar(left, orient=tk.VERTICAL, command=txt.yview)
         txt.configure(yscrollcommand=scr.set)
 
@@ -724,7 +732,7 @@ class ExtractedTextDialog(tk.Toplevel):
         num_entry.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
         ttk.Label(left, text="Caption:").grid(row=1, column=0, sticky="nw", pady=(6, 0))
-        cap = tk.Text(left, wrap="word", height=8)
+        cap = tk.Text(left, wrap="word", height=8, font=TEXT_FONT)
         scr = ttk.Scrollbar(left, orient=tk.VERTICAL, command=cap.yview)
         cap.configure(yscrollcommand=scr.set)
 
@@ -1039,29 +1047,27 @@ class ExtractedTextDialog(tk.Toplevel):
 
             self.json_path.write_text(json.dumps(new_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-            # Notify parent that JSON exists/updated (e.g., update DB path, refresh tree)
-            if self._on_saved_close:
+            # Callback вызывается только при "Save & Close"/"Save & Continue":
+            # сначала закрываем окно, затем планируем callback на parent через
+            # after(0), чтобы parent мог открыть другой Toplevel без конфликта grab'ов.
+            if close_after:
+                cb = self._on_saved_close
+                parent = self.master
+
                 try:
-                    self._on_saved_close()
+                    self.grab_release()
                 except Exception:
                     pass
+                self.destroy()
 
-
-            if close_after:
-                cb = getattr(self, "_on_saved_close", None)
                 if cb is not None:
                     try:
-                        parent = getattr(self, "_notify_parent", None) or getattr(self, "master", None)
                         if parent is not None and hasattr(parent, "after"):
-                            parent.after(0, cb)   # важно: планируем на parent, не на закрываемом Toplevel
+                            parent.after(0, cb)
                         else:
                             cb()
                     except Exception:
-                        try:
-                            cb()
-                        except Exception:
-                            pass
-                self._on_cancel()
+                        pass
             return True
 
         except Exception as e:

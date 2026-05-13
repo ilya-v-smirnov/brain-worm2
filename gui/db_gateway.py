@@ -23,6 +23,7 @@ class FileRow:
     article_id: int
     pdf_path: str
     summary_path: str | None
+    json_path: str | None
 
 
 class DbGateway:
@@ -57,7 +58,8 @@ class DbGateway:
                 SELECT
                     af.article_id,
                     af.pdf_path,
-                    a.summary_path
+                    a.summary_path,
+                    a.json_path
                 FROM ArticleFile af
                 JOIN Article a ON a.id = af.article_id
                 ORDER BY af.pdf_path ASC;
@@ -70,6 +72,7 @@ class DbGateway:
                         article_id=int(r[0]),
                         pdf_path=str(r[1]),
                         summary_path=r[2],
+                        json_path=r[3],
                     )
                 )
             return out

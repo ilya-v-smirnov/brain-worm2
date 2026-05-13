@@ -55,14 +55,16 @@ class MainWindow:
         tree_frame = ttk.Frame(root)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 10))
 
-        columns = ("summary",)
+        columns = ("text_extracted", "summary")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", selectmode="browse")
 
         self.tree.heading("#0", text="Article Database")
+        self.tree.heading("text_extracted", text="Text extracted")
         self.tree.heading("summary", text="Summary")
 
-        self.tree.column("#0", width=900, stretch=True)
-        self.tree.column("summary", width=90, anchor=tk.CENTER, stretch=False)
+        self.tree.column("#0", width=820, stretch=True)
+        self.tree.column("text_extracted", width=100, anchor=tk.CENTER, stretch=False)
+        self.tree.column("summary", width=80, anchor=tk.CENTER, stretch=False)
 
         # Подсветка строк с именами, не соответствующими формату '<Year> <Title>.pdf'
         self.tree.tag_configure("malformed", foreground="#c0392b")
@@ -180,7 +182,7 @@ class MainWindow:
             if folder_key in folder_iids:
                 return folder_iids[folder_key]
 
-            iid = self.tree.insert(parent_iid, "end", text=name, values=("",))
+            iid = self.tree.insert(parent_iid, "end", text=name, values=("", ""))
             self._iid_to_payload[iid] = {"type": "folder", "key": folder_key}
             folder_iids[folder_key] = iid
 
@@ -212,17 +214,19 @@ class MainWindow:
             parent_iid = ensure_folder(parent_iid, parent_key, seg)
 
         filename = parts[-1]
+        text_extracted = CHECK if row.json_path else DASH
         summary = CHECK if row.summary_path else DASH
 
         # Файлы с именем, не соответствующим формату '<Year> <Title>.pdf',
         # подсвечиваем красным — пользователь видит, что их нужно переименовать.
         tags = () if _is_well_named(filename) else ("malformed",)
 
-        iid = self.tree.insert(parent_iid, "end", text=filename, values=(summary,), tags=tags)
+        iid = self.tree.insert(parent_iid, "end", text=filename, values=(text_extracted, summary), tags=tags)
         self._iid_to_payload[iid] = {
             "type": "pdf",
             "article_id": row.article_id,
             "pdf_path": row.pdf_path,
+            "json_path": row.json_path,
             "summary_path": row.summary_path,
         }
 
@@ -253,31 +257,87 @@ class MainWindow:
             messagebox.showinfo("Generate", "Not implemented yet")
             return
 
-        article_id = int(payload["article_id"])
+        # Шаг 1: открываем Extracted Text. После "Save & Continue" обработчик
+        # (см. _open_extracted_text_for) откроет Semi-Manual Summary.
+        self._open_extracted_text_for(payload, continue_to_summary=True)
 
-        json_rel = self.db.fetch_json_path_for_article(article_id)
-        if not json_rel:
-            messagebox.showwarning(
-                "Semi-Manual Summary",
-                "No extracted JSON for this article yet.\n\n"
-                "Use right-click → 'View extracted text' first to create one.",
-            )
+    # ---------------- Pipeline helpers ----------------
+
+    def _open_extracted_text_for(self, payload: dict, *, continue_to_summary: bool) -> None:
+        """
+        Открывает окно Extracted Text для указанной статьи.
+
+        Если continue_to_summary=True, после "Save & Continue" автоматически
+        откроется Semi-Manual Summary с тем же json/pdf.
+        """
+        if not payload or payload.get("type") != "pdf":
+            messagebox.showwarning("Extracted text", "Select an article PDF first.")
             return
-        json_path = Path(self.db.resolve_path(json_rel))
 
+        article_id = int(payload["article_id"])
         pdf_rel = payload.get("pdf_path")
         if not pdf_rel:
-            messagebox.showerror("Semi-Manual Summary", "Internal error: PDF path not found in DB payload.")
+            messagebox.showerror("Extracted text", "Internal error: PDF path not found in payload.")
             return
+
         pdf_path = Path(self.db.resolve_path(pdf_rel))
 
+        try:
+            json_rel = self.db.fetch_json_path_for_article(article_id)
+        except Exception as e:
+            messagebox.showerror("Extracted text", f"{type(e).__name__}: {e}")
+            return
+
+        # If DB has no json_path yet, use default Contents/<pdf_name>.json
+        if not json_rel:
+            json_rel = str(Path("Contents") / (Path(pdf_rel).name)).replace(".pdf", ".json")
+
+        json_path = Path(self.db.resolve_path(json_rel))
+
+        existing_summary_path = payload.get("summary_path")
+
+        def _after_saved() -> None:
+            # Persist json_path into DB and refresh UI
+            try:
+                self.db.set_json_path_for_article(article_id, json_path)
+            except Exception:
+                pass
+            try:
+                self._reload_tree()
+            except Exception:
+                pass
+            # Шаг 2: при continue_to_summary открываем Semi-Manual Summary
+            if continue_to_summary:
+                self._open_semi_manual_summary(
+                    article_id=article_id,
+                    json_path=json_path,
+                    pdf_path=pdf_path,
+                    existing_summary_path=existing_summary_path,
+                )
+
+        ExtractedTextDialog(
+            self.master,
+            json_path=json_path,
+            pdf_path=pdf_path,
+            on_saved_close=_after_saved,
+            continue_to_summary=continue_to_summary,
+        )
+
+    def _open_semi_manual_summary(
+        self,
+        *,
+        article_id: int,
+        json_path: Path,
+        pdf_path: Path,
+        existing_summary_path: str | None,
+    ) -> None:
         win = SemiManualSummaryDialog(
             self.master,
             json_path=json_path,
             pdf_path=pdf_path,
             db_gateway=self.db,
             article_id=article_id,
-            existing_summary_path=payload.get("summary_path"),
+            existing_summary_path=existing_summary_path,
         )
         try:
             self.master.wait_window(win)
@@ -291,7 +351,7 @@ class MainWindow:
         if not payload or payload.get("type") != "pdf":
             return
 
-        col = self.tree.identify_column(event.x)  # '#0', '#1'
+        col = self.tree.identify_column(event.x)  # '#0', '#1', '#2'
 
         def open_rel(rel_or_abs: str | None) -> None:
             if not rel_or_abs:
@@ -300,8 +360,14 @@ class MainWindow:
             open_file(p)
 
         if col == "#0":
+            # Имя файла / PDF
             open_rel(payload.get("pdf_path"))
         elif col == "#1":
+            # Text extracted: открываем редактор (даже если JSON ещё нет —
+            # откроется с пустым шаблоном и пользователь его заполнит).
+            self._open_extracted_text_for(payload, continue_to_summary=False)
+        elif col == "#2":
+            # Summary docx
             open_rel(payload.get("summary_path"))
 
     def _on_right_click(self, event: tk.Event) -> None:
@@ -329,49 +395,7 @@ class MainWindow:
 
     def _on_view_extracted_text(self) -> None:
         payload = self._get_selected_payload()
-        if not payload or payload.get("type") != "pdf":
-            messagebox.showwarning("View extracted text", "Select an article PDF first.")
-            return
-
-        article_id = int(payload["article_id"])
-        pdf_rel = payload.get("pdf_path")
-        if not pdf_rel:
-            messagebox.showerror("View extracted text", "Internal error: PDF path not found in payload.")
-            return
-
-        # Resolve PDF absolute path
-        pdf_path = Path(self.db.resolve_path(pdf_rel))
-
-        try:
-            json_rel = self.db.fetch_json_path_for_article(article_id)
-        except Exception as e:
-            messagebox.showerror("View extracted text", f"{type(e).__name__}: {e}")
-            return
-
-        # If DB has no json_path yet, use default Contents/<pdf_name>.json
-        if not json_rel:
-            json_rel = str(Path("Contents") / (Path(pdf_rel).name)).replace(".pdf", ".json")
-
-        json_path = Path(self.db.resolve_path(json_rel))
-
-        def _after_saved() -> None:
-            # Persist json_path into DB (store rel if possible) and refresh UI
-            try:
-                self.db.set_json_path_for_article(article_id, json_path)
-            except Exception:
-                # Even if DB update fails, keep UI alive; user still has the JSON on disk
-                pass
-            try:
-                self._reload_tree()
-            except Exception:
-                pass
-
-        ExtractedTextDialog(
-            self.master,
-            json_path=json_path,
-            pdf_path=pdf_path,
-            on_saved_close=_after_saved,
-        )
+        self._open_extracted_text_for(payload, continue_to_summary=False)
 
     # ---------------- Utils ----------------
 
