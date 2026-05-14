@@ -74,6 +74,68 @@ def _section(title: str, body: str, *, level: int = 2) -> str:
     return f"{header} {title}\n\n{body}\n"
 
 
+def _metadata_block(metadata: dict[str, Any] | None) -> str:
+    """
+    Render metadata as a bullet list. Skipped entirely if all fields are empty.
+
+    Returns a Markdown string ending with a trailing newline, or "" if there is
+    nothing to render.
+    """
+    if not metadata or not isinstance(metadata, dict):
+        return ""
+
+    fields = [
+        ("First author", str(metadata.get("first_author") or "").strip()),
+        ("Authors",      str(metadata.get("authors") or "").strip()),
+        ("Journal",      str(metadata.get("journal") or "").strip()),
+        ("DOI",          str(metadata.get("doi") or "").strip()),
+        ("PMID",         str(metadata.get("pmid") or "").strip()),
+    ]
+
+    nonempty = [(label, value) for label, value in fields if value]
+    if not nonempty:
+        return ""
+
+    lines: list[str] = []
+    for label, value in nonempty:
+        lines.append(f"- **{label}:** {value}")
+
+    return "\n".join(lines) + "\n"
+
+
+def _metadata_block(metadata: dict[str, Any] | None) -> str:
+    """
+    Render Metadata section as a list of bold-prefixed entries.
+
+    Returns empty string if metadata is missing or all fields are empty
+    (we do not write an empty "## Metadata" header in this case).
+    """
+    if not metadata or not isinstance(metadata, dict):
+        return ""
+
+    fields = [
+        ("PMID", metadata.get("pmid")),
+        ("First author", metadata.get("first_author")),
+        ("Authors", metadata.get("authors")),
+        ("Journal", metadata.get("journal")),
+        ("DOI", metadata.get("doi")),
+    ]
+
+    rendered = [(label, str(value or "").strip()) for label, value in fields]
+    rendered = [(label, value) for label, value in rendered if value]
+    if not rendered:
+        return ""
+
+    lines: list[str] = ["## Metadata", ""]
+    for label, value in rendered:
+        # Заменяем переносы строк в значениях (особенно в Authors, если их много)
+        # на простой пробел, чтобы не разрывать bullet.
+        value_one_line = " ".join(value.split())
+        lines.append(f"- **{label}:** {value_one_line}")
+    lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _figures_block(figures: list[dict[str, Any]] | None) -> str:
     """Render figures as bold-prefixed lines."""
     if not figures:
@@ -172,6 +234,11 @@ def export_extracted_text_to_md(
 
     if source_path:
         chunks.append(f"**Source:** {source_path}")
+        chunks.append("")
+
+    meta_md = _metadata_block(article.get("metadata"))
+    if meta_md:
+        chunks.append(meta_md)
         chunks.append("")
 
     chunks.append(_section("Introduction", str(article.get("introduction") or "")))

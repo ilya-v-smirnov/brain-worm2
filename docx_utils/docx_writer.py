@@ -369,6 +369,24 @@ def export_extracted_text_to_docx(
 
     _blank(doc, 1)
 
+    # === METADATA (PMID / authors / journal / DOI) ===
+    # Year отображается в шапке, дублировать не нужно.
+    metadata = article.get("metadata") or {}
+    if isinstance(metadata, dict):
+        meta_fields: list[tuple[str, str]] = [
+            ("PMID", str(metadata.get("pmid") or "").strip()),
+            ("First author", str(metadata.get("first_author") or "").strip()),
+            ("Authors", str(metadata.get("authors") or "").strip()),
+            ("Journal", str(metadata.get("journal") or "").strip()),
+            ("DOI", str(metadata.get("doi") or "").strip()),
+        ]
+        meta_fields = [(label, value) for label, value in meta_fields if value]
+        if meta_fields:
+            _heading_h2(doc, "Metadata")
+            for label, value in meta_fields:
+                meta_line(label, value)
+            _blank(doc, 1)
+
     # === SECTIONS ===
     def add_section_h2(name: str):
         _heading_h2(doc, name)

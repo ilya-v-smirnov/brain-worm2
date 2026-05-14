@@ -12,6 +12,7 @@ from typing import Any, Callable
 from gui.file_ops import open_file
 from docx_utils.docx_writer import export_extracted_text_to_docx
 from md_utils.md_writer import export_extracted_text_to_md
+from pubmed_utils.pubmed_fetcher import fetch_metadata_by_pmid
 from gui.find_replace_dialog import FindReplaceDialog, FindReplaceState
 
 
@@ -82,8 +83,17 @@ class ExtractedTextDialog(tk.Toplevel):
         self._figure_widgets: list[_FigureWidgets] = []
 
         # Export/copy filters (default OFF)
+        self.include_metadata_var = tk.BooleanVar(value=False)
         self.include_methods_var = tk.BooleanVar(value=False)
         self.include_figures_var = tk.BooleanVar(value=False)
+
+        # Metadata tab fields (PMID + auto-fetched/manually edited values)
+        self.pmid_var = tk.StringVar()
+        self.first_author_var = tk.StringVar()
+        self.journal_var = tk.StringVar()
+        self.doi_var = tk.StringVar()
+        self.metadata_status_var = tk.StringVar(value="")
+        # authors_text is a multi-line tk.Text, created in _build_metadata_inner
 
         self._build_ui()
         self._load_json()
@@ -135,6 +145,12 @@ class ExtractedTextDialog(tk.Toplevel):
             variable=self.include_methods_var,
         ).pack(side=tk.RIGHT, padx=(0, 16))
 
+        ttk.Checkbutton(
+            options,
+            text="Include Metadata",
+            variable=self.include_metadata_var,
+        ).pack(side=tk.RIGHT, padx=(0, 16))
+
         common = ttk.Frame(root)
         common.grid(row=1, column=0, sticky="ew", pady=(10, 6))
         common.columnconfigure(1, weight=1)
@@ -165,11 +181,15 @@ class ExtractedTextDialog(tk.Toplevel):
         self.tab_results = ttk.Frame(self.nb, padding=0)
         self.tab_figures = ttk.Frame(self.nb, padding=0)
 
+        # Metadata tab (PMID + fetched fields)
+        self.tab_metadata = ttk.Frame(self.nb, padding=10)
+
         self.nb.add(self.tab_intro, text="Introduction")
         self.nb.add(self.tab_methods, text="Methods")
         self.nb.add(self.tab_results, text="Results")
         self.nb.add(self.tab_discussion, text="Discussion")
         self.nb.add(self.tab_figures, text="Figures")
+        self.nb.add(self.tab_metadata, text="Metadata")
 
         self.intro_text = self._text_area(self.tab_intro)
         self.methods_text = self._text_area(self.tab_methods)
@@ -191,6 +211,9 @@ class ExtractedTextDialog(tk.Toplevel):
         # Figures: scrollable
         self.figures_canvas, self.figures_inner = self._make_scrollable_tab(self.tab_figures)
         self._build_figures_inner(self.figures_inner)
+
+        # Metadata tab content
+        self._build_metadata_tab(self.tab_metadata)
 
         self._setup_mousewheel_routing()
 
@@ -446,6 +469,123 @@ class ExtractedTextDialog(tk.Toplevel):
         self._populate_from_data(data)
 
 
+    def _build_metadata_tab(self, parent: ttk.Frame) -> None:
+        """
+        UI вкладки Metadata. Слева — labels, справа — поля. Authors — multi-line.
+        Сверху — PMID + кнопка Get metadata, снизу — статус-строка.
+        """
+        parent.columnconfigure(1, weight=1)
+
+        # --- PMID + кнопка Get metadata ---
+        ttk.Label(parent, text="PMID:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+
+        pmid_row = ttk.Frame(parent)
+        pmid_row.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        pmid_row.columnconfigure(0, weight=1)
+
+        pmid_entry = ttk.Entry(pmid_row, textvariable=self.pmid_var)
+        pmid_entry.grid(row=0, column=0, sticky="ew")
+        # Enter в поле PMID = нажать Get metadata
+        pmid_entry.bind("<Return>", lambda _e: self._on_get_metadata())
+
+        self._btn_get_metadata = ttk.Button(pmid_row, text="Get metadata", command=self._on_get_metadata)
+        self._btn_get_metadata.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        # --- First author ---
+        ttk.Label(parent, text="First author:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Entry(parent, textvariable=self.first_author_var).grid(row=1, column=1, sticky="ew", pady=(0, 6))
+
+        # --- Authors (multi-line) ---
+        ttk.Label(parent, text="Authors:").grid(row=2, column=0, sticky="nw", padx=(0, 8), pady=(0, 6))
+
+        authors_frame = ttk.Frame(parent)
+        authors_frame.grid(row=2, column=1, sticky="nsew", pady=(0, 6))
+        authors_frame.columnconfigure(0, weight=1)
+        authors_frame.rowconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        self.authors_text = tk.Text(authors_frame, wrap="word", height=4, font=TEXT_FONT)
+        self.authors_text.grid(row=0, column=0, sticky="nsew")
+
+        authors_scroll = ttk.Scrollbar(authors_frame, orient=tk.VERTICAL, command=self.authors_text.yview)
+        self.authors_text.configure(yscrollcommand=authors_scroll.set)
+        authors_scroll.grid(row=0, column=1, sticky="ns")
+
+        self._install_text_context_menu(self.authors_text)
+        self._bind_select_all_shortcuts(self.authors_text)
+
+        # --- Journal ---
+        ttk.Label(parent, text="Journal:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Entry(parent, textvariable=self.journal_var).grid(row=3, column=1, sticky="ew", pady=(0, 6))
+
+        # --- DOI ---
+        ttk.Label(parent, text="DOI:").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        ttk.Entry(parent, textvariable=self.doi_var).grid(row=4, column=1, sticky="ew", pady=(0, 6))
+
+        # --- Status line ---
+        ttk.Label(parent, textvariable=self.metadata_status_var, foreground="#555555").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+
+    def _on_get_metadata(self) -> None:
+        """
+        Запрашивает у NCBI PubMed метаданные по PMID и заполняет поля.
+        Существующие значения, отличающиеся от пустых, ПЕРЕПИСЫВАЮТСЯ только
+        если PubMed вернул непустые значения.
+        """
+        pmid = self.pmid_var.get().strip()
+        if not pmid:
+            messagebox.showwarning("Get metadata", "Enter a PMID first.")
+            return
+
+        self._btn_get_metadata.config(state="disabled")
+        self.metadata_status_var.set("Fetching from PubMed…")
+        # Принудительно перерисовать UI, чтобы статус появился до сетевого вызова
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+
+        try:
+            meta = fetch_metadata_by_pmid(pmid)
+        except ValueError as e:
+            self.metadata_status_var.set("")
+            messagebox.showerror("Get metadata", str(e))
+            self._btn_get_metadata.config(state="normal")
+            return
+        except RuntimeError as e:
+            self.metadata_status_var.set("")
+            messagebox.showerror("Get metadata", str(e))
+            self._btn_get_metadata.config(state="normal")
+            return
+        except Exception as e:
+            self.metadata_status_var.set("")
+            messagebox.showerror("Get metadata", f"{type(e).__name__}: {e}")
+            self._btn_get_metadata.config(state="normal")
+            return
+
+        # Заполняем поля только если PubMed вернул непустое значение —
+        # пустые значения не перетирают ручной ввод пользователя.
+        if meta.get("pmid"):
+            self.pmid_var.set(meta["pmid"])
+        if meta.get("first_author"):
+            self.first_author_var.set(meta["first_author"])
+        if meta.get("journal"):
+            self.journal_var.set(meta["journal"])
+        if meta.get("doi"):
+            self.doi_var.set(meta["doi"])
+        if meta.get("year"):
+            # Год живёт в основном поле формы (Year), не внутри metadata-блока.
+            self.year_var.set(meta["year"])
+
+        if meta.get("authors"):
+            self.authors_text.delete("1.0", "end")
+            self.authors_text.insert("1.0", meta["authors"])
+
+        self.metadata_status_var.set("Loaded from PubMed.")
+        self._btn_get_metadata.config(state="normal")
+
+
     def _populate_from_data(self, data: dict[str, Any]) -> None:
         """Заполняет UI данными (без записи на диск)."""
         self.original_data = data
@@ -482,6 +622,22 @@ class ExtractedTextDialog(tk.Toplevel):
         if not self._figure_widgets:
             self._add_figure()
 
+        # Metadata block (PMID, first_author, authors, journal, doi)
+        metadata = data.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        self.pmid_var.set(str(metadata.get("pmid", "") or ""))
+        self.first_author_var.set(str(metadata.get("first_author", "") or ""))
+        self.journal_var.set(str(metadata.get("journal", "") or ""))
+        self.doi_var.set(str(metadata.get("doi", "") or ""))
+
+        authors_str = str(metadata.get("authors", "") or "")
+        self.authors_text.delete("1.0", "end")
+        if authors_str:
+            self.authors_text.insert("1.0", authors_str)
+
+        self.metadata_status_var.set("")
+
         self.results_canvas.update_idletasks()
         self.figures_canvas.update_idletasks()
 
@@ -509,10 +665,15 @@ class ExtractedTextDialog(tk.Toplevel):
     def _apply_export_filters(self, obj: dict[str, Any]) -> dict[str, Any]:
         """
         Returns a filtered COPY of obj according to UI tick-boxes:
+        - If Include Metadata is OFF -> metadata becomes {} (writers will skip it)
         - If Include Methods is OFF -> methods becomes ""
         - If Include Figure Captions is OFF -> figures becomes []
         """
         out = deepcopy(obj)
+
+        if not bool(self.include_metadata_var.get()):
+            if "metadata" in out:
+                out["metadata"] = {}
 
         if not bool(self.include_methods_var.get()):
             if "methods" in out:
@@ -1074,6 +1235,17 @@ class ExtractedTextDialog(tk.Toplevel):
 
             new_data["results"] = results
             new_data["figures"] = figures
+
+            # Metadata block (PMID, first author, authors, journal, doi).
+            # Year хранится в верхнем уровне new_data["year"] и не дублируется тут.
+            metadata: dict[str, str] = {
+                "pmid": self.pmid_var.get().strip(),
+                "first_author": self.first_author_var.get().strip(),
+                "authors": self._get_text(self.authors_text).strip(),
+                "journal": self.journal_var.get().strip(),
+                "doi": self.doi_var.get().strip(),
+            }
+            new_data["metadata"] = metadata
 
             # Ensure directory exists (important when JSON is created for the first time)
             try:
